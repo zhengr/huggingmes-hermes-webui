@@ -37,21 +37,13 @@ If you'd rather start from this repo, create a new Space with **SDK = Docker** a
 | Secret | What it is | Example |
 | --- | --- | --- |
 | `GATEWAY_TOKEN` | Your password — gates the WebUI login and the `/v1/*` API. Pick anything strong. | A 32-char random string (`openssl rand -base64 32`) |
-| `LLM_API_KEY` | API key for whichever LLM provider you want to use | `sk-or-v1-...` for OpenRouter, `sk-...` for OpenAI, etc. |
-| `LLM_MODEL` | HuggingMes-style model identifier | `openrouter/anthropic/claude-sonnet-4`, `openai/gpt-4o`, `google/gemini-2.5-flash`, `huggingface/Qwen/Qwen3-235B-A22B-Thinking-2507`, etc. |
-
-**Recommended**:
-
-| Secret | Why | How to get |
-| --- | --- | --- |
 | `HF_TOKEN` | Persists your sessions, profiles, skills, cron jobs, memory, and workspace files across Space restarts by syncing to a private HF Dataset every 10 min. **Without this, restarts wipe everything.** | [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) → New token → **Write** scope |
-| `BACKUP_DATASET_NAME` | If you run multiple instances of this Space (or any other HuggingMes-derived project), set a unique name here so they don't overwrite each other's backups. | e.g. `my-hermes-backup` |
+| `CLOUDFLARE_WORKERS_TOKEN` | Auto-provisions two Cloudflare Workers: one as an outbound proxy (needed for Telegram, sometimes for blocked LLM providers) and one as a cron keep-alive worker that pings `/health` every 10 min so the Space doesn't sleep on free tier |
 
 **Optional advanced features**:
 
 | Secret | What it does |
 | --- | --- |
-| `CLOUDFLARE_WORKERS_TOKEN` | Auto-provisions two Cloudflare Workers: one as an outbound proxy (needed for Telegram, sometimes for blocked LLM providers) and one as a cron keep-alive worker that pings `/health` every 10 min so the Space doesn't sleep on free tier |
 | `CLOUDFLARE_ACCOUNT_ID` | Explicit Cloudflare account ID if you have multiple |
 | `TELEGRAM_BOT_TOKEN` | Enables the Telegram bridge so you can chat with Hermes from Telegram |
 | `TELEGRAM_ALLOWED_USERS` | Comma-separated numeric Telegram user IDs allowed to use the bot |
