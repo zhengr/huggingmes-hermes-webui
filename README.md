@@ -1,15 +1,12 @@
 ---
-title: {{title}}
-emoji: {{emoji}}
-colorFrom: {{colorFrom}}
-colorTo: {{colorTo}}
-sdk: {{sdk}}
-sdk_version: "{{sdkVersion}}"
-{{#pythonVersion}}
-python_version: "{{pythonVersion}}"
-{{/pythonVersion}}
-app_file: app.py
-pinned: false
+title: HuggingMes Hermes WebUI
+emoji: 🪽
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7861
+pinned: true
+license: mit
 ---
 
 Run your own AI agent with a chat interface on Hugging Face Spaces — for free.
