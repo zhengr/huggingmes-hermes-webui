@@ -7,6 +7,9 @@
  *   /login                -> HuggingMes login (password = GATEWAY_TOKEN)
  *   /health /status       -> JSON health (unauthenticated — for HF probes + keepalive)
  *   /hm  /hm/*            -> HuggingMes status page + app (auth-gated)
+ *   /hmd /hmd/*           -> Hermes dashboard passthrough for off-Space
+ *                            workspaces (no router auth — dashboard's own
+ *                            session token gates writes; opt-in by URL)
  *   /dashboard            -> redirect to /hm
  *   /v1  /v1/*            -> Hermes gateway (bearer auth; HTML => login redirect)
  *   /telegram  /telegram/*-> Telegram webhook (unauthenticated; Telegram needs to reach it)
@@ -33,6 +36,17 @@ const GATEWAY_HOST = "127.0.0.1";
 const startTime = Date.now();
 const API_SERVER_KEY = process.env.API_SERVER_KEY || "";
 const HM_PREFIX = "/hm";
+// Dashboard passthrough for off-Space workspaces (e.g. hermes-workspace
+// running on a laptop). Anything under /hmd/* is forwarded directly to the
+// internal dashboard with no router-level auth — the dashboard's own
+// ephemeral session token is the only gate. This is intentional: the
+// workspace scrapes that token from /hmd/ and then sends it as the bearer
+// on /hmd/api/* requests, exactly mirroring the dashboard's normal flow.
+//
+// Implication: anyone who can reach this Space's URL can call the dashboard
+// API (sessions, skills, config). If you don't need remote workspace access,
+// don't share the Space URL or set up an upstream auth layer.
+const HMD_PREFIX = "/hmd";
 const LOGIN_PATH = "/hm/login";
 const SESSION_COOKIE = "huggingmes_session";
 const PRIMARY_UI = (process.env.PRIMARY_UI || "webui").toLowerCase();
@@ -746,6 +760,25 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // /hmd/* — Off-Space dashboard passthrough.
+  //
+  // Forwards verbatim to the internal Hermes dashboard on DASHBOARD_PORT,
+  // including its /api/* endpoints, /assets/*, root HTML (which carries the
+  // ephemeral session token), and WebSocket upgrades. Workspace clients
+  // (e.g. hermes-workspace) point HERMES_DASHBOARD_URL at
+  //   https://<space>/hmd
+  // and the workspace's own scrape-the-token-from-root-HTML logic just
+  // works because /hmd/ returns the unmodified dashboard index.
+  //
+  // SECURITY: this prefix has no router-level auth on purpose — the
+  // dashboard's own session token gates writes. If you need an extra layer,
+  // wrap your Space behind a Cloudflare Access policy or remove this
+  // handler.
+  if (path === HMD_PREFIX || path.startsWith(`${HMD_PREFIX}/`)) {
+    proxyRequest(req, res, DASHBOARD_PORT, (p) => p.replace(HMD_PREFIX, "") || "/");
+    return;
+  }
+
   // /hm/app/* -> Hermes dashboard (SPA with HTML rewriting for base path)
   if (path === `${HM_PREFIX}/app` || path.startsWith(`${HM_PREFIX}/app/`)) {
     if (!requireAuth(req, res)) return;
@@ -884,6 +917,11 @@ server.on("upgrade", (req, clientSocket, head) => {
 
   if (path === "/v1" || path.startsWith("/v1/")) {
     targetPort = GATEWAY_PORT;
+  } else if (path === HMD_PREFIX || path.startsWith(`${HMD_PREFIX}/`)) {
+    // Off-Space dashboard passthrough (mirrors the HTTP /hmd handler).
+    targetPort = DASHBOARD_PORT;
+    targetPath = path.replace(HMD_PREFIX, "") || "/";
+    if (parsed.search) targetPath += parsed.search;
   } else if (path === `${HM_PREFIX}/app` || path.startsWith(`${HM_PREFIX}/app/`)) {
     targetPort = DASHBOARD_PORT;
     targetPath = path.replace(`${HM_PREFIX}/app`, "") || "/";
