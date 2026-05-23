@@ -22,7 +22,12 @@ from pathlib import Path
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("HF_HUB_VERBOSITY", "error")
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "300")
-os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+# huggingface_hub 0.30+ replaced HF_HUB_ENABLE_HF_TRANSFER with this flag;
+# the legacy var triggers a FutureWarning at import on newer hubs and is
+# silently ignored. Setting only the new var means older hubs miss the
+# transfer accelerator (which is fine — they fall back to the standard
+# downloader) but no version emits a deprecation warning.
+os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
 
 from huggingface_hub import HfApi, snapshot_download, upload_folder
 from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
