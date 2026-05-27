@@ -187,4 +187,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=120s \
   CMD curl -fsS http://localhost:7861/health || exit 1
 
 USER hermes
-CMD ["/opt/huggingmes/start.sh"]
+ENTRYPOINT ["/opt/huggingmes/start.sh"]
