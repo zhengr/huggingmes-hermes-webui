@@ -9,8 +9,6 @@ name: Sync to Hugging Face Space
 # https://huggingface.co/settings/tokens
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 jobs:
