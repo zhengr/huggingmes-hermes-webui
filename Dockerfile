@@ -36,7 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/* \
     && uv pip install --python /opt/hermes/.venv/bin/python --no-cache-dir \
-        huggingface_hub hf_transfer pyyaml
+        huggingface_hub hf_transfer pyyaml edge-tts
 
 # Clone nesquena/hermes-webui (install deps into the agent venv so imports resolve)
 RUN git clone --depth 1 --branch ${WEBUI_REF} \
@@ -44,8 +44,7 @@ RUN git clone --depth 1 --branch ${WEBUI_REF} \
  && ( [ -f /opt/hermes-webui/requirements.txt ] \
       && /opt/hermes/.venv/bin/pip install --no-cache-dir -r /opt/hermes-webui/requirements.txt \
       || true ) \
- && chown -R hermes:hermes /opt/hermes-webui \
- && pip install edge-tts
+ && chown -R hermes:hermes /opt/hermes-webui
 
 # HuggingMes-style integration scripts (vendored from somratpro/HuggingMes)
 COPY --chown=hermes:hermes start.sh                       /opt/huggingmes/start.sh
