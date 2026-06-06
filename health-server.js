@@ -923,34 +923,58 @@ const server = http.createServer(async (req, res) => {
   // actual error body without needing SSH/Pro.
   if (path === `${HM_PREFIX}/debug/model-options`) {
     if (!requireAuth(req, res)) return;
-    const localOrigin = `http://${GATEWAY_HOST}:${DASHBOARD_PORT}`;
-    const probe = http.request(
-      {
-        hostname: GATEWAY_HOST,
-        port: DASHBOARD_PORT,
-        method: "GET",
-        path: "/api/model/options",
-        headers: { host: `${GATEWAY_HOST}:${DASHBOARD_PORT}`, origin: localOrigin },
-      },
-      (upRes) => {
+    const localHost = `${GATEWAY_HOST}:${DASHBOARD_PORT}`;
+    const localOrigin = `http://${localHost}`;
+    // Step 1: fetch dashboard root to extract session token
+    const rootReq = http.request(
+      { hostname: GATEWAY_HOST, port: DASHBOARD_PORT, method: "GET", path: "/", headers: { host: localHost, origin: localOrigin } },
+      (rootRes) => {
         const chunks = [];
-        upRes.on("data", (c) => chunks.push(c));
-        upRes.on("end", () => {
-          const body = Buffer.concat(chunks).toString("utf8");
-          res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
-          res.end(`Status: ${upRes.statusCode}\nHeaders: ${JSON.stringify(upRes.headers, null, 2)}\n\n${body}`);
+        rootRes.on("data", (c) => chunks.push(c));
+        rootRes.on("end", () => {
+          const html = Buffer.concat(chunks).toString("utf8");
+          const m = html.match(/__HERMES_SESSION_TOKEN__\s*[=:]\s*["']([A-Za-z0-9_\-]+)["']/)
+            || html.match(/session[_-]?token\s*[=:]\s*["']([A-Za-z0-9_\-]+)["']/i);
+          const token = m ? m[1] : "";
+          if (!token) {
+            res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+            res.end(`Could not extract session token from dashboard HTML.\n\nHTML preview (first 500 chars):\n${html.slice(0, 500)}`);
+            return;
+          }
+          // Step 2: hit /api/model/options with the token
+          const apiReq = http.request(
+            { hostname: GATEWAY_HOST, port: DASHBOARD_PORT, method: "GET", path: "/api/model/options", headers: { host: localHost, origin: localOrigin, "x-hermes-session-token": token } },
+            (apiRes) => {
+              const bodyChunks = [];
+              apiRes.on("data", (c) => bodyChunks.push(c));
+              apiRes.on("end", () => {
+                const body = Buffer.concat(bodyChunks).toString("utf8");
+                res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+                res.end(`Token: ${token.slice(0, 8)}...\nStatus: ${apiRes.statusCode}\nHeaders: ${JSON.stringify(apiRes.headers, null, 2)}\n\n${body}`);
+              });
+              apiRes.on("error", (e) => {
+                res.writeHead(502, { "content-type": "text/plain" });
+                res.end(`API probe error: ${e.message}`);
+              });
+            },
+          );
+          apiReq.on("error", (e) => {
+            res.writeHead(502, { "content-type": "text/plain" });
+            res.end(`API connection error: ${e.message}`);
+          });
+          apiReq.end();
         });
-        upRes.on("error", (e) => {
+        rootRes.on("error", (e) => {
           res.writeHead(502, { "content-type": "text/plain" });
-          res.end(`Dashboard probe error: ${e.message}`);
+          res.end(`Dashboard root error: ${e.message}`);
         });
       },
     );
-    probe.on("error", (e) => {
+    rootReq.on("error", (e) => {
       res.writeHead(502, { "content-type": "text/plain" });
       res.end(`Dashboard connection error: ${e.message}`);
     });
-    probe.end();
+    rootReq.end();
     return;
   }
 
