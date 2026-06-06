@@ -303,6 +303,62 @@ function proxyRequest(
     "x-forwarded-proto": req.headers["x-forwarded-proto"] || "https",
   };
 
+  // Python's BaseHTTPRequestHandler (used by hermes-webui and the dashboard)
+  // cannot decode chunked request bodies — read_body() only reads via
+  // Content-Length, and leftover chunk framing corrupts subsequent requests
+  // on keep-alive connections (HTTP 501 with junk prepended to the method).
+  // Buffer the full body and send it with an explicit Content-Length header
+  // so Node.js never uses Transfer-Encoding: chunked.
+  const hasBody = req.method === "POST" || req.method === "PUT" || req.method === "PATCH";
+  if (hasBody) {
+    const chunks = [];
+    let size = 0;
+    const limit = 20 * 1024 * 1024;
+    req.on("data", (chunk) => {
+      chunks.push(chunk);
+      size += chunk.length;
+      if (size > limit) {
+        req.destroy();
+        if (!res.headersSent) {
+          res.writeHead(413, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "payload_too_large" }));
+        }
+      }
+    });
+    req.on("end", () => {
+      delete headers["transfer-encoding"];
+      headers["content-length"] = String(size);
+      const proxy = http.request(
+        {
+          hostname: GATEWAY_HOST,
+          port: targetPort,
+          method: req.method,
+          path: targetPath,
+          headers,
+        },
+        (upstream) => {
+          res.writeHead(upstream.statusCode || 502, upstream.headers);
+          upstream.pipe(res);
+        },
+      );
+      proxy.on("error", (error) => {
+        if (!res.headersSent) {
+          res.writeHead(502, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "proxy_error", message: error.message }));
+        }
+      });
+      if (size > 0) proxy.write(Buffer.concat(chunks));
+      proxy.end();
+    });
+    req.on("error", (error) => {
+      if (!res.headersSent) {
+        res.writeHead(502, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "proxy_error", message: error.message }));
+      }
+    });
+    return;
+  }
+
   const proxy = http.request(
     {
       hostname: GATEWAY_HOST,
@@ -438,7 +494,29 @@ function proxyDashboard(req, res) {
     res.end(JSON.stringify({ error: "proxy_error", message: error.message }));
   });
 
-  req.pipe(upstream);
+  // Buffer body before forwarding — same chunked-encoding fix as proxyRequest.
+  const hasBody = req.method === "POST" || req.method === "PUT" || req.method === "PATCH";
+  if (hasBody) {
+    const bodyChunks = [];
+    let bodySize = 0;
+    req.on("data", (chunk) => {
+      bodyChunks.push(chunk);
+      bodySize += chunk.length;
+    });
+    req.on("end", () => {
+      delete headers["transfer-encoding"];
+      headers["content-length"] = String(bodySize);
+      upstream.end(Buffer.concat(bodyChunks));
+    });
+    req.on("error", (error) => {
+      if (!res.headersSent) {
+        res.writeHead(502, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "proxy_error", message: error.message }));
+      }
+    });
+  } else {
+    req.pipe(upstream);
+  }
 }
 
 /* ── Status JSON + HuggingMes status page ─────────────────────────── */
