@@ -978,13 +978,40 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // /hm/debug/model-options-trace — runs the Python debug script that
-  // calls build_models_payload() directly with full traceback output.
+  // /hm/debug/model-options-trace — runs Python directly to call
+  // build_models_payload() with full traceback output.
   if (path === `${HM_PREFIX}/debug/model-options-trace`) {
     if (!requireAuth(req, res)) return;
     const { execFile } = require("child_process");
-    const script = `${process.env.HUGGINGMES_APP_DIR || "/opt/huggingmes"}/debug-model-options.py`;
-    execFile("/opt/hermes/.venv/bin/python", [script], { timeout: 30000 }, (err, stdout, stderr) => {
+    const pyCode = `
+import os, sys, traceback
+os.environ.setdefault("HERMES_HOME", "/opt/data")
+sys.path.insert(0, "/opt/hermes")
+sys.path.insert(0, "/opt/hermes/.venv/lib/python3.12/site-packages")
+try:
+    from hermes_cli.inventory import build_models_payload, load_picker_context
+    ctx = load_picker_context()
+    print("=== load_picker_context OK ===")
+    print("  current_model:", repr(ctx.current_model))
+    print("  current_provider:", repr(ctx.current_provider))
+    print("  current_base_url:", repr(ctx.current_base_url))
+    print("  user_providers:", type(ctx.user_providers).__name__, list(ctx.user_providers.keys()) if isinstance(ctx.user_providers, dict) else "")
+    print("  custom_providers:", type(ctx.custom_providers).__name__, list(ctx.custom_providers.keys()) if isinstance(ctx.custom_providers, dict) else "")
+except Exception:
+    print("=== load_picker_context FAILED ===")
+    traceback.print_exc()
+    sys.exit(0)
+try:
+    result = build_models_payload(ctx, max_models=50, include_unconfigured=True, picker_hints=True, canonical_order=True, pricing=True, capabilities=True)
+    print("=== build_models_payload OK ===")
+    print("  providers count:", len(result.get("providers", [])))
+    print("  model:", repr(result.get("model")))
+    print("  provider:", repr(result.get("provider")))
+except Exception:
+    print("=== build_models_payload FAILED ===")
+    traceback.print_exc()
+`;
+    execFile("/opt/hermes/.venv/bin/python", ["-c", pyCode], { timeout: 30000 }, (err, stdout, stderr) => {
       res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
       res.end(`--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}\n--- exit ---\n${err ? err.message : "0"}`);
     });
