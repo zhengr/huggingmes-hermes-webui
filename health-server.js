@@ -1049,11 +1049,30 @@ server.on("upgrade", (req, clientSocket, head) => {
   }
 
   const upstream = net.createConnection(targetPort, GATEWAY_HOST, () => {
-    // Forward the HTTP upgrade handshake verbatim
+    // Rewrite Host to the local backend so the dashboard/gateway accept the
+    // WebSocket origin. Desktop app → HF proxy sends Host: <space>.hf.space
+    // but the dashboard checks against its own bind address (127.0.0.1:PORT).
+    const localHost = `${GATEWAY_HOST}:${targetPort}`;
     const headerLines = [
       `${req.method} ${targetPath} HTTP/1.1`,
     ];
     for (const [name, value] of Object.entries(req.headers)) {
+      // Rewrite Host and Origin so the backend accepts the WS handshake.
+      // The dashboard's origin guard checks Origin against its own host.
+      if (name.toLowerCase() === "host") {
+        headerLines.push(`Host: ${localHost}`);
+        continue;
+      }
+      if (name.toLowerCase() === "origin") {
+        // Rewrite wss://<space>.hf.space or https:// to the local backend.
+        try {
+          const origUrl = new URL(value);
+          headerLines.push(`Origin: http://${localHost}`);
+        } catch {
+          headerLines.push(`Origin: http://${localHost}`);
+        }
+        continue;
+      }
       if (Array.isArray(value)) {
         for (const v of value) headerLines.push(`${name}: ${v}`);
       } else {
