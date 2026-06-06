@@ -882,6 +882,42 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // /hm/logs — view service logs without needing HF Pro SSH.
+  if (path === `${HM_PREFIX}/logs` || path.startsWith(`${HM_PREFIX}/logs/`)) {
+    if (!requireAuth(req, res)) return;
+    const logDir = `${process.env.HERMES_HOME || "/opt/data"}/logs`;
+    const logFiles = ["dashboard.log", "gateway.log", "webui.log"];
+    if (path.startsWith(`${HM_PREFIX}/logs/`)) {
+      const name = path.slice(`${HM_PREFIX}/logs/`.length);
+      if (!logFiles.includes(name)) {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end("Not found");
+        return;
+      }
+      try {
+        const tail = Number(parsed.searchParams.get("tail") || 200);
+        const content = fs.readFileSync(`${logDir}/${name}`, "utf8");
+        const lines = content.split("\n");
+        const sliced = lines.slice(-tail);
+        res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+        res.end(sliced.join("\n"));
+      } catch {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end(`Log file ${name} not found`);
+      }
+      return;
+    }
+    const links = logFiles.map((f) => {
+      const size = (() => { try { return fs.statSync(`${logDir}/${f}`).size; } catch { return 0; } })();
+      return `<li><a href="${HM_PREFIX}/logs/${f}?tail=200">${escapeHtml(f)}</a> (${(size / 1024).toFixed(1)} KB)</li>`;
+    }).join("");
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.end(`<!doctype html><html><head><meta charset="utf-8"/><title>HuggingMes Logs</title>
+<style>body{font-family:monospace;background:#0a0a12;color:#e0e0e0;padding:20px}a{color:#38bdf8}h1{font-size:1.2rem}li{margin:8px 0}</style></head>
+<body><h1>Service Logs</h1><p>Append <code>?tail=N</code> to limit lines (default 200).</p><ul>${links}</ul></body></html>`);
+    return;
+  }
+
   // Legacy /dashboard -> /hm
   if (path === "/dashboard" || path === "/dashboard/") {
     redirect(res, `${HM_PREFIX}${parsed.search}`);
