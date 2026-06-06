@@ -918,6 +918,42 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // /hm/debug/model-options — debug proxy: fetch /api/model/options from
+  // the dashboard directly and return the raw response so we can see the
+  // actual error body without needing SSH/Pro.
+  if (path === `${HM_PREFIX}/debug/model-options`) {
+    if (!requireAuth(req, res)) return;
+    const localOrigin = `http://${GATEWAY_HOST}:${DASHBOARD_PORT}`;
+    const probe = http.request(
+      {
+        hostname: GATEWAY_HOST,
+        port: DASHBOARD_PORT,
+        method: "GET",
+        path: "/api/model/options",
+        headers: { host: `${GATEWAY_HOST}:${DASHBOARD_PORT}`, origin: localOrigin },
+      },
+      (upRes) => {
+        const chunks = [];
+        upRes.on("data", (c) => chunks.push(c));
+        upRes.on("end", () => {
+          const body = Buffer.concat(chunks).toString("utf8");
+          res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+          res.end(`Status: ${upRes.statusCode}\nHeaders: ${JSON.stringify(upRes.headers, null, 2)}\n\n${body}`);
+        });
+        upRes.on("error", (e) => {
+          res.writeHead(502, { "content-type": "text/plain" });
+          res.end(`Dashboard probe error: ${e.message}`);
+        });
+      },
+    );
+    probe.on("error", (e) => {
+      res.writeHead(502, { "content-type": "text/plain" });
+      res.end(`Dashboard connection error: ${e.message}`);
+    });
+    probe.end();
+    return;
+  }
+
   // Legacy /dashboard -> /hm
   if (path === "/dashboard" || path === "/dashboard/") {
     redirect(res, `${HM_PREFIX}${parsed.search}`);
