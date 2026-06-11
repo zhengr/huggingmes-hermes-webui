@@ -60,6 +60,10 @@ fi
 # ── Setup state dirs ──────────────────────────────────────────────────
 mkdir -p "$HERMES_HOME"/{cron,sessions,logs,hooks,memories,skills,skins,plans,workspace,home,plugins,webui}
 
+# Ensure the dashboard PTY starts in the workspace dir so the desktop app's
+# file browser sees a valid directory (not /opt/hermes or /).
+cd "$HERMES_HOME/workspace" || cd "$HERMES_HOME"
+
 # Rotate on-disk logs at boot. The router + WebUI + dashboard tee their
 # stdout into $HERMES_HOME/logs/*.log via `tee -a`, which means without
 # rotation those files grow forever and end up in the HF Dataset backup.
@@ -369,7 +373,7 @@ fi
 
 # ── Launch Hermes dashboard (private; proxied via /hm/app) ────────────
 echo "Launching Hermes dashboard on 127.0.0.1:${DASHBOARD_PORT}..."
-(hermes dashboard --host 127.0.0.1 --insecure 2>&1 | tee -a "$HERMES_HOME/logs/dashboard.log") &
+(cd "$HERMES_HOME/workspace" && hermes dashboard --host 127.0.0.1 --insecure 2>&1 | tee -a "$HERMES_HOME/logs/dashboard.log") &
 DASHBOARD_PID=$!
 
 # ── Launch Hermes gateway ─────────────────────────────────────────────
