@@ -295,13 +295,71 @@ function proxyRequest(
 ) {
   const parsed = new URL(req.url, "http://localhost");
   const targetPath = rewritePath(parsed.pathname) + parsed.search;
+  const localOrigin = `http://${GATEWAY_HOST}:${targetPort}`;
   const headers = {
     ...req.headers,
     ...headerOverrides,
     host: `${GATEWAY_HOST}:${targetPort}`,
+    origin: localOrigin,
     "x-forwarded-host": req.headers.host || "",
     "x-forwarded-proto": req.headers["x-forwarded-proto"] || "https",
   };
+
+  // Python's BaseHTTPRequestHandler (used by hermes-webui and the dashboard)
+  // cannot decode chunked request bodies — read_body() only reads via
+  // Content-Length, and leftover chunk framing corrupts subsequent requests
+  // on keep-alive connections (HTTP 501 with junk prepended to the method).
+  // Buffer the full body and send it with an explicit Content-Length header
+  // so Node.js never uses Transfer-Encoding: chunked.
+  const hasBody = req.method === "POST" || req.method === "PUT" || req.method === "PATCH";
+  if (hasBody) {
+    const chunks = [];
+    let size = 0;
+    const limit = 20 * 1024 * 1024;
+    req.on("data", (chunk) => {
+      chunks.push(chunk);
+      size += chunk.length;
+      if (size > limit) {
+        req.destroy();
+        if (!res.headersSent) {
+          res.writeHead(413, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "payload_too_large" }));
+        }
+      }
+    });
+    req.on("end", () => {
+      delete headers["transfer-encoding"];
+      headers["content-length"] = String(size);
+      const proxy = http.request(
+        {
+          hostname: GATEWAY_HOST,
+          port: targetPort,
+          method: req.method,
+          path: targetPath,
+          headers,
+        },
+        (upstream) => {
+          res.writeHead(upstream.statusCode || 502, upstream.headers);
+          upstream.pipe(res);
+        },
+      );
+      proxy.on("error", (error) => {
+        if (!res.headersSent) {
+          res.writeHead(502, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "proxy_error", message: error.message }));
+        }
+      });
+      if (size > 0) proxy.write(Buffer.concat(chunks));
+      proxy.end();
+    });
+    req.on("error", (error) => {
+      if (!res.headersSent) {
+        res.writeHead(502, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "proxy_error", message: error.message }));
+      }
+    });
+    return;
+  }
 
   const proxy = http.request(
     {
@@ -362,6 +420,7 @@ function proxyDashboard(req, res) {
   const headers = {
     ...req.headers,
     host: `${GATEWAY_HOST}:${DASHBOARD_PORT}`,
+    origin: `http://${GATEWAY_HOST}:${DASHBOARD_PORT}`,
     "x-forwarded-host": req.headers.host || "",
     "x-forwarded-proto": req.headers["x-forwarded-proto"] || "https",
     // Disable upstream compression so we can rewrite text responses.
@@ -438,7 +497,29 @@ function proxyDashboard(req, res) {
     res.end(JSON.stringify({ error: "proxy_error", message: error.message }));
   });
 
-  req.pipe(upstream);
+  // Buffer body before forwarding — same chunked-encoding fix as proxyRequest.
+  const hasBody = req.method === "POST" || req.method === "PUT" || req.method === "PATCH";
+  if (hasBody) {
+    const bodyChunks = [];
+    let bodySize = 0;
+    req.on("data", (chunk) => {
+      bodyChunks.push(chunk);
+      bodySize += chunk.length;
+    });
+    req.on("end", () => {
+      delete headers["transfer-encoding"];
+      headers["content-length"] = String(bodySize);
+      upstream.end(Buffer.concat(bodyChunks));
+    });
+    req.on("error", (error) => {
+      if (!res.headersSent) {
+        res.writeHead(502, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "proxy_error", message: error.message }));
+      }
+    });
+  } else {
+    req.pipe(upstream);
+  }
 }
 
 /* ── Status JSON + HuggingMes status page ─────────────────────────── */
@@ -801,6 +882,142 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // /hm/logs — view service logs without needing HF Pro SSH.
+  if (path === `${HM_PREFIX}/logs` || path.startsWith(`${HM_PREFIX}/logs/`)) {
+    if (!requireAuth(req, res)) return;
+    const logDir = `${process.env.HERMES_HOME || "/opt/data"}/logs`;
+    const logFiles = ["dashboard.log", "gateway.log", "webui.log"];
+    if (path.startsWith(`${HM_PREFIX}/logs/`)) {
+      const name = path.slice(`${HM_PREFIX}/logs/`.length);
+      if (!logFiles.includes(name)) {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end("Not found");
+        return;
+      }
+      try {
+        const tail = Number(parsed.searchParams.get("tail") || 200);
+        const content = fs.readFileSync(`${logDir}/${name}`, "utf8");
+        const lines = content.split("\n");
+        const sliced = lines.slice(-tail);
+        res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+        res.end(sliced.join("\n"));
+      } catch {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end(`Log file ${name} not found`);
+      }
+      return;
+    }
+    const links = logFiles.map((f) => {
+      const size = (() => { try { return fs.statSync(`${logDir}/${f}`).size; } catch { return 0; } })();
+      return `<li><a href="${HM_PREFIX}/logs/${f}?tail=200">${escapeHtml(f)}</a> (${(size / 1024).toFixed(1)} KB)</li>`;
+    }).join("");
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.end(`<!doctype html><html><head><meta charset="utf-8"/><title>HuggingMes Logs</title>
+<style>body{font-family:monospace;background:#0a0a12;color:#e0e0e0;padding:20px}a{color:#38bdf8}h1{font-size:1.2rem}li{margin:8px 0}</style></head>
+<body><h1>Service Logs</h1><p>Append <code>?tail=N</code> to limit lines (default 200).</p><ul>${links}</ul></body></html>`);
+    return;
+  }
+
+  // /hm/debug/model-options — debug proxy: fetch /api/model/options from
+  // the dashboard directly and return the raw response so we can see the
+  // actual error body without needing SSH/Pro.
+  if (path === `${HM_PREFIX}/debug/model-options`) {
+    if (!requireAuth(req, res)) return;
+    const localHost = `${GATEWAY_HOST}:${DASHBOARD_PORT}`;
+    const localOrigin = `http://${localHost}`;
+    // Step 1: fetch dashboard root to extract session token
+    const rootReq = http.request(
+      { hostname: GATEWAY_HOST, port: DASHBOARD_PORT, method: "GET", path: "/", headers: { host: localHost, origin: localOrigin } },
+      (rootRes) => {
+        const chunks = [];
+        rootRes.on("data", (c) => chunks.push(c));
+        rootRes.on("end", () => {
+          const html = Buffer.concat(chunks).toString("utf8");
+          const m = html.match(/__HERMES_SESSION_TOKEN__\s*[=:]\s*["']([A-Za-z0-9_\-]+)["']/)
+            || html.match(/session[_-]?token\s*[=:]\s*["']([A-Za-z0-9_\-]+)["']/i);
+          const token = m ? m[1] : "";
+          if (!token) {
+            res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+            res.end(`Could not extract session token from dashboard HTML.\n\nHTML preview (first 500 chars):\n${html.slice(0, 500)}`);
+            return;
+          }
+          // Step 2: hit /api/model/options with the token
+          const apiReq = http.request(
+            { hostname: GATEWAY_HOST, port: DASHBOARD_PORT, method: "GET", path: "/api/model/options", headers: { host: localHost, origin: localOrigin, "x-hermes-session-token": token } },
+            (apiRes) => {
+              const bodyChunks = [];
+              apiRes.on("data", (c) => bodyChunks.push(c));
+              apiRes.on("end", () => {
+                const body = Buffer.concat(bodyChunks).toString("utf8");
+                res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+                res.end(`Token: ${token.slice(0, 8)}...\nStatus: ${apiRes.statusCode}\nHeaders: ${JSON.stringify(apiRes.headers, null, 2)}\n\n${body}`);
+              });
+              apiRes.on("error", (e) => {
+                res.writeHead(502, { "content-type": "text/plain" });
+                res.end(`API probe error: ${e.message}`);
+              });
+            },
+          );
+          apiReq.on("error", (e) => {
+            res.writeHead(502, { "content-type": "text/plain" });
+            res.end(`API connection error: ${e.message}`);
+          });
+          apiReq.end();
+        });
+        rootRes.on("error", (e) => {
+          res.writeHead(502, { "content-type": "text/plain" });
+          res.end(`Dashboard root error: ${e.message}`);
+        });
+      },
+    );
+    rootReq.on("error", (e) => {
+      res.writeHead(502, { "content-type": "text/plain" });
+      res.end(`Dashboard connection error: ${e.message}`);
+    });
+    rootReq.end();
+    return;
+  }
+
+  // /hm/debug/model-options-trace — runs Python directly to call
+  // build_models_payload() with full traceback output.
+  if (path === `${HM_PREFIX}/debug/model-options-trace`) {
+    if (!requireAuth(req, res)) return;
+    const { execFile } = require("child_process");
+    const pyCode = `
+import os, sys, traceback
+os.environ.setdefault("HERMES_HOME", "/opt/data")
+sys.path.insert(0, "/opt/hermes")
+sys.path.insert(0, "/opt/hermes/.venv/lib/python3.12/site-packages")
+try:
+    from hermes_cli.inventory import build_models_payload, load_picker_context
+    ctx = load_picker_context()
+    print("=== load_picker_context OK ===")
+    print("  current_model:", repr(ctx.current_model))
+    print("  current_provider:", repr(ctx.current_provider))
+    print("  current_base_url:", repr(ctx.current_base_url))
+    print("  user_providers:", type(ctx.user_providers).__name__, list(ctx.user_providers.keys()) if isinstance(ctx.user_providers, dict) else "")
+    print("  custom_providers:", type(ctx.custom_providers).__name__, list(ctx.custom_providers.keys()) if isinstance(ctx.custom_providers, dict) else "")
+except Exception:
+    print("=== load_picker_context FAILED ===")
+    traceback.print_exc()
+    sys.exit(0)
+try:
+    result = build_models_payload(ctx, max_models=50, include_unconfigured=True, picker_hints=True, canonical_order=True, pricing=True, capabilities=True)
+    print("=== build_models_payload OK ===")
+    print("  providers count:", len(result.get("providers", [])))
+    print("  model:", repr(result.get("model")))
+    print("  provider:", repr(result.get("provider")))
+except Exception:
+    print("=== build_models_payload FAILED ===")
+    traceback.print_exc()
+`;
+    execFile("/opt/hermes/.venv/bin/python", ["-c", pyCode], { timeout: 30000 }, (err, stdout, stderr) => {
+      res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+      res.end(`--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}\n--- exit ---\n${err ? err.message : "0"}`);
+    });
+    return;
+  }
+
   // Legacy /dashboard -> /hm
   if (path === "/dashboard" || path === "/dashboard/") {
     redirect(res, `${HM_PREFIX}${parsed.search}`);
@@ -971,11 +1188,30 @@ server.on("upgrade", (req, clientSocket, head) => {
   }
 
   const upstream = net.createConnection(targetPort, GATEWAY_HOST, () => {
-    // Forward the HTTP upgrade handshake verbatim
+    // Rewrite Host to the local backend so the dashboard/gateway accept the
+    // WebSocket origin. Desktop app → HF proxy sends Host: <space>.hf.space
+    // but the dashboard checks against its own bind address (127.0.0.1:PORT).
+    const localHost = `${GATEWAY_HOST}:${targetPort}`;
     const headerLines = [
       `${req.method} ${targetPath} HTTP/1.1`,
     ];
     for (const [name, value] of Object.entries(req.headers)) {
+      // Rewrite Host and Origin so the backend accepts the WS handshake.
+      // The dashboard's origin guard checks Origin against its own host.
+      if (name.toLowerCase() === "host") {
+        headerLines.push(`Host: ${localHost}`);
+        continue;
+      }
+      if (name.toLowerCase() === "origin") {
+        // Rewrite wss://<space>.hf.space or https:// to the local backend.
+        try {
+          const origUrl = new URL(value);
+          headerLines.push(`Origin: http://${localHost}`);
+        } catch {
+          headerLines.push(`Origin: http://${localHost}`);
+        }
+        continue;
+      }
       if (Array.isArray(value)) {
         for (const v of value) headerLines.push(`${name}: ${v}`);
       } else {
