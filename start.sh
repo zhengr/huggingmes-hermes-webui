@@ -389,22 +389,25 @@ graceful_shutdown() {
     # grace period (HF SIGKILLs after ~30s on Free tier).
     timeout 25 python3 "$APP_DIR/hermes-sync.py" sync-once || echo "Warning: shutdown sync failed."
   fi
-  # Kill process groups, not just job PIDs. The services are pipelines
-  # (cmd | tee), so killing the subshell PID leaves hermes/tee alive and
-  # the port bound. setsid (below) makes each child its own session/group
-  # leader, so kill -- -PGID takes down the whole group.
+  # Kill each service PID and its children. The services are pipelines
+  # (cmd | tee) launched in subshells, so killing the subshell PID alone
+  # leaves hermes/tee alive and the port bound. pkill -P gets the direct
+  # children of each PID (the actual hermes/python/tee processes).
+  # Tini (PID 1) then reaps any remaining orphans.
   for pid in "${HEALTH_PID:-}" "${DASHBOARD_PID:-}" "${GATEWAY_PID:-}" "${WEBUI_PID:-}" "${LOOP_PID:-}"; do
     [ -n "$pid" ] || continue
-    kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+    pkill -P "$pid" 2>/dev/null || true
+    kill "$pid" 2>/dev/null || true
   done
   exit 0
 }
 trap graceful_shutdown SIGTERM SIGINT
 
 # ── Start the public-facing router (port 7861) ────────────────────────
-# setsid makes each service a session/process-group leader so graceful_shutdown
-# can kill -- -PGID and take down the whole pipeline (hermes + tee), not just
-# the subshell. Without this, kill $(jobs -p) left hermes bound to its port.
+# setsid on node makes it a process-group leader so Tini can reap it
+# cleanly. The other services use subshells (not setsid bash -c) because
+# bash -c calls getcwd() on startup and fails when the HF Dataset restore
+# has wiped start.sh's inherited CWD.
 setsid node "$APP_DIR/health-server.js" &
 HEALTH_PID=$!
 
@@ -435,13 +438,11 @@ PY
 fi
 
 # ── Launch Hermes dashboard (private; proxied via /hm/app) ────────────
-# Re-cd to a known-good dir before setsid: the HF Dataset restore above may
-# have wiped/recreated $HERMES_HOME/workspace, leaving start.sh's inherited
-# CWD stale. setsid bash -c '...' inherits this CWD and the inner bash calls
-# getcwd() on startup — a stale CWD makes it fail before the inner cd runs.
-cd "$HERMES_HOME/workspace" 2>/dev/null || cd "$HERMES_HOME" 2>/dev/null || cd /
+# The subshell form (cd ... && cmd | tee) works even when start.sh's CWD is
+# stale (after the HF Dataset restore wipes dirs under $HERMES_HOME): the
+# subshell's cd changes to an absolute path before any getcwd() is needed.
 echo "Launching Hermes dashboard on 127.0.0.1:${DASHBOARD_PORT}..."
-setsid bash -c '(cd "$HERMES_HOME/workspace" && hermes dashboard --host 127.0.0.1 --insecure 2>&1 | tee -a "$HERMES_HOME/logs/dashboard.log")' &
+(cd "$HERMES_HOME/workspace" && hermes dashboard --host 127.0.0.1 --insecure 2>&1 | tee -a "$HERMES_HOME/logs/dashboard.log") &
 DASHBOARD_PID=$!
 
 # ── Launch Hermes gateway ─────────────────────────────────────────────
@@ -460,7 +461,7 @@ DASHBOARD_PID=$!
 # directory" and causing the gateway to fail/loop on startup.
 mkdir -p "$HERMES_HOME/workspace" "$HERMES_HOME/logs"
 echo "Launching Hermes gateway..."
-setsid bash -c '(cd "$HERMES_HOME/workspace" && hermes gateway 2>&1 | tee -a "$HERMES_HOME/logs/gateway.log")' &
+(cd "$HERMES_HOME/workspace" && hermes gateway 2>&1 | tee -a "$HERMES_HOME/logs/gateway.log") &
 GATEWAY_PID=$!
 
 GATEWAY_READY_TIMEOUT="${GATEWAY_READY_TIMEOUT:-120}"
@@ -500,9 +501,9 @@ export HERMES_WEBUI_AUTO_INSTALL="0"
 mkdir -p "$HERMES_WEBUI_STATE_DIR"
 
 echo "Launching Hermes WebUI on 127.0.0.1:${WEBUI_PORT}..."
-setsid bash -c '(cd "$WEBUI_REPO" && \
+(cd "$WEBUI_REPO" && \
    "$HERMES_WEBUI_PYTHON" "$WEBUI_REPO/server.py" 2>&1 | \
-   tee -a "$HERMES_HOME/logs/webui.log")' &
+   tee -a "$HERMES_HOME/logs/webui.log") &
 WEBUI_PID=$!
 
 # Wait for WebUI to bind its port. Previously this was "non-fatal" (warn +
