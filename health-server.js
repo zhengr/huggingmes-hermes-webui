@@ -436,12 +436,34 @@ function proxyRequest(
         (upstream) => {
           res.writeHead(upstream.statusCode || 502, upstream.headers);
           upstream.pipe(res);
+          // D1: handle mid-response backend socket errors without crashing.
+          upstream.on("error", () => {
+            if (!res.headersSent) {
+              try {
+                res.writeHead(502, { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: "upstream_error" }));
+              } catch {}
+            } else {
+              try { res.destroy(); } catch {}
+            }
+          });
         },
       );
+      // D3: 30s timeout on the upstream request.
+      proxy.setTimeout(30000, () => {
+        if (!res.headersSent) {
+          res.writeHead(504, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "upstream_timeout" }));
+        }
+        try { proxy.destroy(new Error("upstream_timeout")); } catch {}
+      });
+      // D2: guard headersSent on the proxy error handler.
       proxy.on("error", (error) => {
         if (!res.headersSent) {
           res.writeHead(502, { "content-type": "application/json" });
           res.end(JSON.stringify({ error: "proxy_error", message: error.message }));
+        } else {
+          try { res.destroy(); } catch {}
         }
       });
       if (size > 0) proxy.write(Buffer.concat(chunks));
@@ -468,12 +490,42 @@ function proxyRequest(
     (upstream) => {
       res.writeHead(upstream.statusCode || 502, upstream.headers);
       upstream.pipe(res);
+      // D1: an unhandled 'error' on a piped IncomingMessage throws and can
+      // crash the router. If the backend socket resets mid-response, log +
+      // destroy the response cleanly instead of taking down every fronted
+      // service.
+      upstream.on("error", () => {
+        if (!res.headersSent) {
+          try {
+            res.writeHead(502, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: "upstream_error" }));
+          } catch {}
+        } else {
+          try { res.destroy(); } catch {}
+        }
+      });
     },
   );
 
+  // D3: 30s timeout so a hung backend (accepts the socket but never
+  // responds) can't hold a request + upstream socket open forever.
+  proxy.setTimeout(30000, () => {
+    if (!res.headersSent) {
+      res.writeHead(504, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "upstream_timeout" }));
+    }
+    try { proxy.destroy(new Error("upstream_timeout")); } catch {}
+  });
+
+  // D2: guard headersSent so a late 'error' after headers were already
+  // written doesn't throw ERR_HTTP_HEADERS_SENT inside the error handler.
   proxy.on("error", (error) => {
-    res.writeHead(502, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "proxy_error", message: error.message }));
+    if (!res.headersSent) {
+      res.writeHead(502, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "proxy_error", message: error.message }));
+    } else {
+      try { res.destroy(); } catch {}
+    }
   });
 
   req.pipe(proxy);
@@ -541,6 +593,18 @@ function proxyDashboard(req, res) {
       if (!shouldRewrite) {
         res.writeHead(upRes.statusCode || 502, upRes.headers);
         upRes.pipe(res);
+        // D1: handle mid-response backend socket errors on the non-rewrite
+        // path (the rewrite path has its own upRes.on('error') below).
+        upRes.on("error", () => {
+          if (!res.headersSent) {
+            try {
+              res.writeHead(502, { "content-type": "application/json" });
+              res.end(JSON.stringify({ error: "upstream_error" }));
+            } catch {}
+          } else {
+            try { res.destroy(); } catch {}
+          }
+        });
         return;
       }
 
@@ -581,17 +645,40 @@ function proxyDashboard(req, res) {
         res.end(buf);
       });
       upRes.on("error", () => {
-        try {
-          res.writeHead(502);
-          res.end();
-        } catch {}
+        // D2: guard headersSent — in the rewrite path, res.writeHead may
+        // already have fired (it fires in the 'end' handler). The old code
+        // called writeHead unconditionally → ERR_HTTP_HEADERS_SENT.
+        if (!res.headersSent) {
+          try {
+            res.writeHead(502);
+            res.end();
+          } catch {}
+        } else {
+          try { res.destroy(); } catch {}
+        }
       });
     },
   );
 
+  // D3: 30s timeout on the dashboard upstream request.
+  upstream.setTimeout(30000, () => {
+    if (!res.headersSent) {
+      res.writeHead(504, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "upstream_timeout" }));
+    }
+    try { upstream.destroy(new Error("upstream_timeout")); } catch {}
+  });
+
+  // D2: guard headersSent on the ClientRequest error handler. The old code
+  // called writeHead unconditionally, which throws if the response callback
+  // already fired and is streaming.
   upstream.on("error", (error) => {
-    res.writeHead(502, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "proxy_error", message: error.message }));
+    if (!res.headersSent) {
+      res.writeHead(502, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "proxy_error", message: error.message }));
+    } else {
+      try { res.destroy(); } catch {}
+    }
   });
 
   // Buffer body before forwarding — same chunked-encoding fix as proxyRequest.
@@ -1228,6 +1315,11 @@ except Exception:
   })();
   const refererIsDashboard = refererPath.startsWith(`${HM_PREFIX}/app`);
 
+  // NOTE: Referer is client-controlled, so a caller who sets Referer: /hm/app
+  // can route requests that would otherwise go to WebUI (e.g. /api/*) to the
+  // dashboard. This is functional routing, not a privilege boundary — the
+  // block below calls requireAuth() before proxying to the dashboard, so a
+  // spoofed Referer doesn't grant any access the caller didn't already have.
   if (refererIsDashboard) {
     // Anything with a Referer from the dashboard goes to the dashboard,
     // *except* requests that explicitly start with /webui (escape hatch).
@@ -1304,6 +1396,20 @@ except Exception:
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`HuggingMes + Hermes WebUI router listening on 0.0.0.0:${PORT}`);
+});
+
+// D4: last-resort guards so one bad request/response can't crash the
+// router and take down every fronted service. An unhandled stream error
+// (e.g. a backend socket reset on a response we forgot to attach an
+// 'error' listener to) would otherwise throw and terminate the process.
+process.on("uncaughtException", (err) => {
+  console.error("uncaughtException in router (continuing):", err && err.stack ? err.stack : err);
+});
+process.on("unhandledRejection", (err) => {
+  console.error("unhandledRejection in router (continuing):", err);
+});
+server.on("error", (err) => {
+  console.error("router server error:", err && err.stack ? err.stack : err);
 });
 
 /* ── WebSocket upgrade handling ─────────────────────────────────────
