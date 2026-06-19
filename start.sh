@@ -315,6 +315,23 @@ if os.environ.get("TELEGRAM_BOT_TOKEN"):
 
 path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
 path.chmod(0o600)
+
+# config.yaml now carries terminal.cwd (above), so TERMINAL_CWD in .env is
+# redundant. Hermes v0.17.0 deprecated it and warns on every gateway
+# start ("Deprecated .env settings detected: TERMINAL_CWD=..."). The
+# dashboard Env tab / older Hermes versions may re-add it; strip it on
+# every boot so the warning stays gone.
+env_file = home / ".env"
+if env_file.exists():
+    try:
+        lines = env_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        kept = [ln for ln in lines if not ln.strip().startswith("TERMINAL_CWD=")]
+        if len(kept) != len(lines):
+            env_file.write_text("\n".join(kept).rstrip() + "\n", encoding="utf-8")
+            env_file.chmod(0o600)
+            print(f"Removed deprecated TERMINAL_CWD from {env_file}")
+    except OSError as exc:
+        print(f"Warning: could not clean {env_file}: {exc}")
 PY
 
 # ── Startup summary ───────────────────────────────────────────────────
