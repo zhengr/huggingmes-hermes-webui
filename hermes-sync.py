@@ -202,12 +202,23 @@ def resolve_backup_repo() -> str:
     return _REPO_ID_CACHE
 
 
+_REPO_VERIFIED = False
+
+
 def ensure_repo_exists() -> str:
+    # The repo only needs to be created once per process lifetime. After that
+    # the repo_info() check on every sync_once was pure overhead + an extra
+    # rate-limited HF Hub API call per sync.
+    global _REPO_VERIFIED
     repo_id = resolve_backup_repo()
+    if _REPO_VERIFIED:
+        return repo_id
     try:
         HF_API.repo_info(repo_id=repo_id, repo_type="dataset")
+        _REPO_VERIFIED = True
     except RepositoryNotFoundError:
         HF_API.create_repo(repo_id=repo_id, repo_type="dataset", private=True)
+        _REPO_VERIFIED = True
     return repo_id
 
 
@@ -230,18 +241,41 @@ def should_exclude(rel_posix: str, path: Path) -> bool:
     return False
 
 
+def _walk_files(root: Path):
+    """Yield (rel_posix, path) for every non-excluded file under root.
+
+    Uses os.walk with in-place dir pruning so we never descend into
+    EXCLUDED_DIRS (node_modules, .venv, __pycache__, .cache, ...). The old
+    rglob('*') walked into those subtrees and stat'd every file before
+    filtering them out — a populated node_modules taxed every 2s poll.
+    """
+    if not root.exists():
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Prune excluded dirs in-place so os.walk skips them entirely.
+        dirnames[:] = [d for d in dirnames if d not in EXCLUDED_DIRS]
+        # Skip top-level excluded entries (config.yaml, .env, logs, ...).
+        # For nested paths, EXCLUDED_DIRS (checked above) handles subtrees;
+        # EXCLUDED_TOP_LEVEL only applies to the root's direct children.
+        rel_dir = os.path.relpath(dirpath, root).replace(os.sep, "/")
+        is_root = rel_dir == "."
+        if is_root:
+            filenames = [f for f in filenames if f not in EXCLUDED_TOP_LEVEL]
+        for name in filenames:
+            path = Path(dirpath, name)
+            rel = path.relative_to(root).as_posix()
+            if should_exclude(rel, path):
+                continue
+            yield rel, path
+
+
 def metadata_marker(root: Path) -> tuple[int, int, int]:
     if not root.exists():
         return (0, 0, 0)
     file_count = 0
     total_size = 0
     newest_mtime = 0
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        rel = path.relative_to(root).as_posix()
-        if should_exclude(rel, path):
-            continue
+    for _rel, path in _walk_files(root):
         try:
             stat = path.stat()
         except OSError:
@@ -256,10 +290,9 @@ def fingerprint_dir(root: Path) -> str:
     hasher = hashlib.sha256()
     if not root.exists():
         return hasher.hexdigest()
-    for path in sorted(p for p in root.rglob("*") if p.is_file()):
-        rel = path.relative_to(root).as_posix()
-        if should_exclude(rel, path):
-            continue
+    # Sort by rel path so the fingerprint is stable across runs/platforms.
+    entries = sorted(_walk_files(root), key=lambda e: e[0])
+    for rel, path in entries:
         hasher.update(rel.encode("utf-8"))
         with path.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):

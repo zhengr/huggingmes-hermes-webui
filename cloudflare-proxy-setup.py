@@ -178,20 +178,52 @@ def main() -> int:
             worker_name = derive_worker_name()
             proxy_secret = existing_secret or secrets.token_urlsafe(24)
 
-            cf_request(
-                "PUT",
-                f"/accounts/{account_id}/workers/scripts/{worker_name}",
-                api_token,
-                body=render_worker(proxy_secret, allowed, allow_proxy_all).encode("utf-8"),
-                content_type="application/javascript",
-            )
-            cf_request(
-                "POST",
-                f"/accounts/{account_id}/workers/scripts/{worker_name}/subdomain",
-                api_token,
-                body=json.dumps({"enabled": True, "previews_enabled": True}).encode("utf-8"),
-            )
-            write_env(f"https://{worker_name}.{subdomain}.workers.dev", proxy_secret)
+            # C8: check if the worker already exists before re-uploading. The
+            # old code re-uploaded the full worker source on every boot even
+            # when it already existed with the same config. Skip if present
+            # (we can't cheaply diff source, so presence is the gate).
+            worker_exists = False
+            try:
+                resp = cf_request(
+                    "GET",
+                    f"/accounts/{account_id}/workers/scripts/{worker_name}",
+                    api_token,
+                )
+                worker_exists = bool(resp)
+            except Exception:
+                pass  # 404 or error → provision fresh
+
+            if not worker_exists:
+                cf_request(
+                    "PUT",
+                    f"/accounts/{account_id}/workers/scripts/{worker_name}",
+                    api_token,
+                    body=render_worker(proxy_secret, allowed, allow_proxy_all).encode("utf-8"),
+                    content_type="application/javascript",
+                )
+                cf_request(
+                    "POST",
+                    f"/accounts/{account_id}/workers/scripts/{worker_name}/subdomain",
+                    api_token,
+                    body=json.dumps({"enabled": True, "previews_enabled": True}).encode("utf-8"),
+                )
+                write_env(f"https://{worker_name}.{subdomain}.workers.dev", proxy_secret)
+                # C9: the proxy URL + secret are written to an ephemeral file
+                # that doesn't survive reboot. To stop the secret rotating on
+                # every restart, persist these as HF Space Secrets:
+                #   CLOUDFLARE_PROXY_URL = https://<worker>.workers.dev
+                #   CLOUDFLARE_PROXY_SECRET = <the generated secret above>
+                # Once set, existing_url/existing_secret are populated at boot
+                # and this provision block is skipped entirely.
+                print(
+                    "Cloudflare proxy worker provisioned. To make the URL + "
+                    "secret persistent across reboots, set these as HF Space "
+                    f"Secrets:\n  CLOUDFLARE_PROXY_URL=https://{worker_name}.{subdomain}.workers.dev\n"
+                    f"  CLOUDFLARE_PROXY_SECRET={proxy_secret}",
+                    file=sys.stderr,
+                )
+            else:
+                write_env(f"https://{worker_name}.{subdomain}.workers.dev", proxy_secret)
 
         return 0
     except Exception as exc:

@@ -55,8 +55,61 @@ const SYNC_STATUS_FILE = "/tmp/huggingmes-sync-status.json";
 const CLOUDFLARE_KEEPALIVE_STATUS_FILE =
   "/tmp/huggingmes-cloudflare-keepalive-status.json";
 
+// Reuse loopback connections to internal backends. Node's global agent
+// defaults to keepAlive:false, so every proxied request opened a fresh TCP
+// connection and closed it after the response — a lot of handshakes for a
+// chat UI making many /api/* and /v1/* calls per session.
+const internalAgent = new http.Agent({
+  keepAlive: true,
+  maxSockets: 64,
+  timeout: 30000,
+});
+
 /* ── Port probing + auth ──────────────────────────────────────────── */
 
+/**
+ * HTTP-level liveness probe. A bare TCP connect (the old canConnect) only
+ * verifies a socket accepts — a wedged backend that opens the socket but never
+ * responds still passes. This issues a tiny GET and treats a connection
+ * error, timeout, or non-2xx/3xx as down. Falls back to a plain TCP connect
+ * if the backend doesn't speak HTTP on '/' (some internal services don't).
+ */
+function httpProbe(port, host = GATEWAY_HOST, timeoutMs = 800) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      try { req.destroy(); } catch {}
+      resolve(ok);
+    };
+    const req = http.get(
+      { hostname: host, port, path: "/", timeout: timeoutMs },
+      (res) => {
+        // Any HTTP response (even 404) means the backend is alive and
+        // speaking HTTP — a wedged process wouldn't have responded.
+        finish(res.statusCode != null);
+      },
+    );
+    req.on("timeout", () => finish(false));
+    req.on("error", () => {
+      // Non-HTTP service or connection refused. Fall back to a TCP probe
+      // so we don't false-negative a backend that's up but doesn't serve /.
+      const socket = net.createConnection({ port, host });
+      const tcpDone = (ok) => {
+        socket.removeAllListeners();
+        socket.destroy();
+        finish(ok);
+      };
+      socket.setTimeout(timeoutMs);
+      socket.once("connect", () => tcpDone(true));
+      socket.once("timeout", () => tcpDone(false));
+      socket.once("error", () => tcpDone(false));
+    });
+  });
+}
+
+/** @deprecated use httpProbe — kept for any external callers. */
 function canConnect(port, host = GATEWAY_HOST, timeoutMs = 600) {
   return new Promise((resolve) => {
     const socket = net.createConnection({ port, host });
@@ -378,6 +431,7 @@ function proxyRequest(
           method: req.method,
           path: targetPath,
           headers,
+          agent: internalAgent,
         },
         (upstream) => {
           res.writeHead(upstream.statusCode || 502, upstream.headers);
@@ -409,6 +463,7 @@ function proxyRequest(
       method: req.method,
       path: targetPath,
       headers,
+      agent: internalAgent,
     },
     (upstream) => {
       res.writeHead(upstream.statusCode || 502, upstream.headers);
@@ -475,6 +530,7 @@ function proxyDashboard(req, res) {
       method: req.method,
       path: targetPath,
       headers,
+      agent: internalAgent,
     },
     (upRes) => {
       const contentType = String(upRes.headers["content-type"] || "");
@@ -586,21 +642,47 @@ function formatUptime(ms) {
   return `${minutes}m`;
 }
 
+// Memoize statusPayload for ~1.5s. Every /health, /hm, /hm/status, /status
+// call previously re-probed all backends sequentially (up to ~2.4s). The
+// Cloudflare keepalive + HF probes hit these frequently, and under load the
+// serial awaits + synchronous file reads blocked the single-threaded event
+// loop. A short TTL promise collapses concurrent calls into one probe set.
+let _statusCache = null;
+let _statusCacheAt = 0;
+const STATUS_CACHE_TTL_MS = 1500;
+
+async function readJsonAsync(path, fallback = null) {
+  try {
+    const content = await fs.promises.readFile(path, "utf8");
+    return JSON.parse(content);
+  } catch {
+    return fallback;
+  }
+}
+
 async function statusPayload() {
-  const gateway = await canConnect(GATEWAY_PORT);
-  const dashboard = await canConnect(DASHBOARD_PORT);
-  const webui = await canConnect(WEBUI_PORT);
-  const telegramWebhook =
-    !!process.env.TELEGRAM_WEBHOOK_URL &&
-    (await canConnect(TELEGRAM_WEBHOOK_PORT));
-  const sync = readJson(
+  const now = Date.now();
+  if (_statusCache && now - _statusCacheAt < STATUS_CACHE_TTL_MS) {
+    return _statusCache;
+  }
+  // Parallel probes: 3-4 independent TCP/HTTP checks in one tick instead of
+  // 3-4 sequential awaits (~2.4s → ~0.8s worst case).
+  const hasTelegramWebhook = !!process.env.TELEGRAM_WEBHOOK_URL;
+  const [gateway, dashboard, webui, telegramWebhook] = await Promise.all([
+    httpProbe(GATEWAY_PORT),
+    httpProbe(DASHBOARD_PORT),
+    httpProbe(WEBUI_PORT),
+    hasTelegramWebhook ? httpProbe(TELEGRAM_WEBHOOK_PORT) : Promise.resolve(false),
+  ]);
+  const sync = await readJsonAsync(
     SYNC_STATUS_FILE,
     process.env.HF_TOKEN
       ? { status: "configured", message: "Backup enabled; waiting for first sync." }
       : { status: "disabled", message: "HF_TOKEN is not configured." },
   );
+  const keepalive = await readJsonAsync(CLOUDFLARE_KEEPALIVE_STATUS_FILE, null);
 
-  return {
+  const payload = {
     ok: gateway && webui,
     uptime: formatUptime(Date.now() - startTime),
     startedAt: new Date(startTime).toISOString(),
@@ -633,8 +715,11 @@ async function statusPayload() {
       process.env.HERMES_INFERENCE_PROVIDER ||
       "auto",
     backup: sync,
-    keepalive: readJson(CLOUDFLARE_KEEPALIVE_STATUS_FILE, null),
+    keepalive,
   };
+  _statusCache = payload;
+  _statusCacheAt = now;
+  return payload;
 }
 
 function toneBadge(label, tone = "neutral") {
@@ -958,8 +1043,22 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       try {
-        const tail = Number(parsed.searchParams.get("tail") || 200);
-        const content = fs.readFileSync(`${logDir}/${name}`, "utf8");
+        // Validate + clamp the tail param. Previously NaN/negative/huge
+        // values were passed straight to slice(-tail), which behaved oddly.
+        let tail = Number(parsed.searchParams.get("tail") || 200);
+        if (!Number.isFinite(tail) || tail < 0) tail = 200;
+        if (tail > 10000) tail = 10000;
+        const filePath = `${logDir}/${name}`;
+        const stat = fs.statSync(filePath);
+        // Cap file size before reading. A multi-hundred-MB log read
+        // synchronously would block the event loop for seconds and spike
+        // memory. Reject files over 50 MB with a 413 instead.
+        if (stat.size > 50 * 1024 * 1024) {
+          res.writeHead(413, { "content-type": "text/plain" });
+          res.end(`Log file ${name} is ${(stat.size / 1024 / 1024).toFixed(1)} MB — too large to serve in-browser. SSH in or rotate the log first.`);
+          return;
+        }
+        const content = await fs.promises.readFile(filePath, "utf8");
         const lines = content.split("\n");
         const sliced = lines.slice(-tail);
         res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
@@ -977,7 +1076,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     res.end(`<!doctype html><html><head><meta charset="utf-8"/><title>HuggingMes Logs</title>
 <style>body{font-family:monospace;background:#0a0a12;color:#e0e0e0;padding:20px}a{color:#38bdf8}h1{font-size:1.2rem}li{margin:8px 0}</style></head>
-<body><h1>Service Logs</h1><p>Append <code>?tail=N</code> to limit lines (default 200).</p><ul>${links}</ul></body></html>`);
+<body><h1>Service Logs</h1><p>Append <code>?tail=N</code> to limit lines (default 200, max 10000).</p><ul>${links}</ul></body></html>`);
     return;
   }
 
@@ -990,7 +1089,7 @@ const server = http.createServer(async (req, res) => {
     const localOrigin = `http://${localHost}`;
     // Step 1: fetch dashboard root to extract session token
     const rootReq = http.request(
-      { hostname: GATEWAY_HOST, port: DASHBOARD_PORT, method: "GET", path: "/", headers: { host: localHost, origin: localOrigin } },
+      { hostname: GATEWAY_HOST, port: DASHBOARD_PORT, method: "GET", path: "/", headers: { host: localHost, origin: localOrigin }, agent: internalAgent },
       (rootRes) => {
         const chunks = [];
         rootRes.on("data", (c) => chunks.push(c));
@@ -1006,7 +1105,7 @@ const server = http.createServer(async (req, res) => {
           }
           // Step 2: hit /api/model/options with the token
           const apiReq = http.request(
-            { hostname: GATEWAY_HOST, port: DASHBOARD_PORT, method: "GET", path: "/api/model/options", headers: { host: localHost, origin: localOrigin, "x-hermes-session-token": token } },
+            { hostname: GATEWAY_HOST, port: DASHBOARD_PORT, method: "GET", path: "/api/model/options", headers: { host: localHost, origin: localOrigin, "x-hermes-session-token": token }, agent: internalAgent },
             (apiRes) => {
               const bodyChunks = [];
               apiRes.on("data", (c) => bodyChunks.push(c));

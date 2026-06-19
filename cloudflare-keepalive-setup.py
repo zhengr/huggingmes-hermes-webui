@@ -171,25 +171,40 @@ def setup_keepalive_worker(api_token: str, account_id: str, subdomain: str) -> N
     worker_name = derive_keepalive_worker_name()
     worker_source = render_keepalive_worker(target_url)
 
-    cf_request(
-        "PUT",
-        f"/accounts/{account_id}/workers/scripts/{worker_name}",
-        api_token,
-        body=worker_source.encode("utf-8"),
-        content_type="application/javascript",
-    )
-    cf_request(
-        "POST",
-        f"/accounts/{account_id}/workers/scripts/{worker_name}/subdomain",
-        api_token,
-        body=json.dumps({"enabled": True, "previews_enabled": True}).encode("utf-8"),
-    )
-    cf_request(
-        "PUT",
-        f"/accounts/{account_id}/workers/scripts/{worker_name}/schedules",
-        api_token,
-        body=json.dumps([{"cron": cron}]).encode("utf-8"),
-    )
+    # C8: check if the worker already exists before re-uploading. The old
+    # code re-uploaded the worker source + re-enabled subdomain + overwrote
+    # the schedule on every boot (3 CF API calls per boot). Skip if present.
+    worker_exists = False
+    try:
+        resp = cf_request(
+            "GET",
+            f"/accounts/{account_id}/workers/scripts/{worker_name}",
+            api_token,
+        )
+        worker_exists = bool(resp)
+    except Exception:
+        pass  # 404 or error → provision fresh
+
+    if not worker_exists:
+        cf_request(
+            "PUT",
+            f"/accounts/{account_id}/workers/scripts/{worker_name}",
+            api_token,
+            body=worker_source.encode("utf-8"),
+            content_type="application/javascript",
+        )
+        cf_request(
+            "POST",
+            f"/accounts/{account_id}/workers/scripts/{worker_name}/subdomain",
+            api_token,
+            body=json.dumps({"enabled": True, "previews_enabled": True}).encode("utf-8"),
+        )
+        cf_request(
+            "PUT",
+            f"/accounts/{account_id}/workers/scripts/{worker_name}/schedules",
+            api_token,
+            body=json.dumps([{"cron": cron}]).encode("utf-8"),
+        )
 
     worker_url = f"https://{worker_name}.{subdomain}.workers.dev"
     write_keepalive_status(
