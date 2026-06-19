@@ -435,6 +435,11 @@ PY
 fi
 
 # ── Launch Hermes dashboard (private; proxied via /hm/app) ────────────
+# Re-cd to a known-good dir before setsid: the HF Dataset restore above may
+# have wiped/recreated $HERMES_HOME/workspace, leaving start.sh's inherited
+# CWD stale. setsid bash -c '...' inherits this CWD and the inner bash calls
+# getcwd() on startup — a stale CWD makes it fail before the inner cd runs.
+cd "$HERMES_HOME/workspace" 2>/dev/null || cd "$HERMES_HOME" 2>/dev/null || cd /
 echo "Launching Hermes dashboard on 127.0.0.1:${DASHBOARD_PORT}..."
 setsid bash -c '(cd "$HERMES_HOME/workspace" && hermes dashboard --host 127.0.0.1 --insecure 2>&1 | tee -a "$HERMES_HOME/logs/dashboard.log")' &
 DASHBOARD_PID=$!
