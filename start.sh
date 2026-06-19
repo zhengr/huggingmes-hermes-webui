@@ -63,6 +63,31 @@ if [ -n "${GATEWAY_TOKEN:-}" ]; then
   export HERMES_WEBUI_PASSWORD="${HERMES_WEBUI_PASSWORD:-$GATEWAY_TOKEN}"
 fi
 
+# ── Stable dashboard session token (desktop app persistence) ──────────
+# Hermes v0.17.0 generates a random session token per dashboard process
+# start (hermes_cli/web_server.py:216):
+#   _SESSION_TOKEN = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or secrets.token_urlsafe(32)
+# The desktop app connects via /hmd using this token. Without a stable
+# value, the token changes on every Space restart → the user must re-scrape
+# it from /hmd/ HTML and reconfigure the desktop app each time.
+#
+# If HERMES_DASHBOARD_SESSION_TOKEN is set as an HF Space Secret, use it
+# (power users can pin an explicit value). Otherwise generate once and
+# persist to the backed-up HERMES_HOME so it survives restarts.
+DASHBOARD_TOKEN_FILE="$HERMES_HOME/.huggingmes-dashboard-session-token"
+if [ -z "${HERMES_DASHBOARD_SESSION_TOKEN:-}" ]; then
+  if [ -f "$DASHBOARD_TOKEN_FILE" ]; then
+    export HERMES_DASHBOARD_SESSION_TOKEN="$(cat "$DASHBOARD_TOKEN_FILE" 2>/dev/null)"
+  else
+    HERMES_DASHBOARD_SESSION_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+    export HERMES_DASHBOARD_SESSION_TOKEN
+    # HERMES_HOME may not exist yet on first boot — mkdir covers that.
+    mkdir -p "$HERMES_HOME"
+    printf '%s' "$HERMES_DASHBOARD_SESSION_TOKEN" > "$DASHBOARD_TOKEN_FILE"
+    chmod 600 "$DASHBOARD_TOKEN_FILE" 2>/dev/null || true
+  fi
+fi
+
 # ── Setup state dirs ──────────────────────────────────────────────────
 mkdir -p "$HERMES_HOME"/{cron,sessions,logs,hooks,memories,skills,skins,plans,workspace,home,plugins,webui}
 

@@ -803,6 +803,10 @@ async function statusPayload() {
       "auto",
     backup: sync,
     keepalive,
+    // Stable dashboard session token for the Hermes desktop app. Persisted
+    // by start.sh so it survives restarts — the user configures the desktop
+    // app once and it stays connected across Space reboots.
+    dashboardSessionToken: process.env.HERMES_DASHBOARD_SESSION_TOKEN || "",
   };
   _statusCache = payload;
   _statusCacheAt = now;
@@ -891,6 +895,16 @@ function renderStatusPage(data) {
       value: `<code>${valueOrUnset(data.model)}</code>`,
       detail: `Provider: ${valueOrUnset(data.provider || "auto")}`,
       tone: data.model ? "ok" : "warn",
+    }),
+    renderTile({
+      title: "Desktop App",
+      value: data.dashboardSessionToken
+        ? toneBadge("Ready", "ok")
+        : toneBadge("No token", "warn"),
+      detail: data.dashboardSessionToken
+        ? `<a href="${HM_PREFIX}/desktop-app-setup">Setup guide</a> · token: <code>${escapeHtml(data.dashboardSessionToken.slice(0, 8))}…</code>`
+        : "HERMES_DASHBOARD_SESSION_TOKEN not set",
+      tone: data.dashboardSessionToken ? "ok" : "warn",
     }),
     renderTile({
       title: "Runtime",
@@ -1114,6 +1128,61 @@ const server = http.createServer(async (req, res) => {
     const data = await statusPayload();
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(data, null, 2));
+    return;
+  }
+
+  // /hm/desktop-app-setup — copy-pasteable desktop app connection info.
+  // Shows the stable session token + remote gateway URL so the user can
+  // configure the Hermes desktop app once and have it survive restarts.
+  if (path === `${HM_PREFIX}/desktop-app-setup`) {
+    if (!requireAuth(req, res)) return;
+    const token = process.env.HERMES_DASHBOARD_SESSION_TOKEN || "";
+    const host = req.headers["x-forwarded-host"] || req.headers.host || "";
+    const baseUrl = host ? `https://${host}` : "";
+    const remoteUrl = `${baseUrl}${HMD_PREFIX}`;
+    if (wantsHtml(req)) {
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      res.end(`<!doctype html><html><head><meta charset="utf-8"/><title>Desktop App Setup</title>
+<style>
+body{font-family:monospace;background:#0a0a12;color:#e0e0e0;padding:20px;max-width:720px;margin:0 auto}
+h1{font-size:1.3rem;color:#38bdf8}
+.box{background:#15151f;border:1px solid #2a2a3a;padding:16px;margin:12px 0;border-radius:8px}
+.label{color:#94a3b8;font-size:0.85rem;margin-bottom:4px}
+.value{word-break:break-all;color:#e0e0e0;font-size:0.95rem}
+.copy{cursor:pointer;background:#1e293b;border:1px solid #334155;color:#38bdf8;padding:4px 12px;border-radius:4px;font-size:0.8rem;margin-top:8px}
+.copy:hover{background:#334155}
+.note{color:#94a3b8;font-size:0.85rem;margin-top:16px;line-height:1.5}
+</style></head><body>
+<h1>Hermes Desktop App — Remote Setup</h1>
+<p>Configure once. These values persist across Space restarts (the session token is saved to the backed-up state volume).</p>
+<div class="box">
+<div class="label">Remote Gateway URL</div>
+<div class="value">${escapeHtml(remoteUrl)}</div>
+</div>
+<div class="box">
+<div class="label">Session Token</div>
+<div class="value">${escapeHtml(token)}</div>
+</div>
+<div class="box">
+<div class="label">Steps</div>
+<div class="value" style="line-height:1.6">
+1. Open the Hermes desktop app<br/>
+2. Settings → Gateway → Remote gateway<br/>
+3. URL: paste the Remote Gateway URL above<br/>
+4. Session token: paste the token above<br/>
+5. Connect — it should stay connected across restarts
+</div>
+</div>
+<p class="note">In the desktop app: chat, model picker, and settings work remotely. File browser and terminal panel show your local PC (upstream desktop app limitation). For remote files/terminal, use the WebUI at <a href="/" style="color:#38bdf8">/</a>.</p>
+</body></html>`);
+    } else {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        remoteGatewayUrl: remoteUrl,
+        sessionToken: token,
+        note: "Configure once in the desktop app: Settings → Gateway → Remote gateway. Persists across restarts.",
+      }, null, 2));
+    }
     return;
   }
 
