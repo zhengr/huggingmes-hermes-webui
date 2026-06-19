@@ -383,8 +383,16 @@ DASHBOARD_PID=$!
 # Space container there is no s6 and no systemd, so the only supported path
 # is foreground mode: `hermes gateway`. See:
 # https://hermes-agent.nousresearch.com/docs/user-guide/messaging
+#
+# Explicitly cd into a known-good directory before launching. The HF
+# Dataset restore at the top of start.sh wipes/recreates dirs under
+# $HERMES_HOME, so start.sh's inherited CWD may have been deleted — and
+# v0.17.0's `hermes gateway` calls getcwd() more eagerly than the old
+# `gateway run` did, producing "sh: 0: getcwd() failed: No such file or
+# directory" and causing the gateway to fail/loop on startup.
+mkdir -p "$HERMES_HOME/workspace" "$HERMES_HOME/logs"
 echo "Launching Hermes gateway..."
-(hermes gateway 2>&1 | tee -a "$HERMES_HOME/logs/gateway.log") &
+(cd "$HERMES_HOME/workspace" && hermes gateway 2>&1 | tee -a "$HERMES_HOME/logs/gateway.log") &
 GATEWAY_PID=$!
 
 GATEWAY_READY_TIMEOUT="${GATEWAY_READY_TIMEOUT:-120}"
