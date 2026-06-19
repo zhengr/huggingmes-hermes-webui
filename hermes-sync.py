@@ -158,8 +158,11 @@ def write_status(status: str, message: str, fingerprint: str | None = None, mark
     try:
         tmp_path.write_text(json.dumps(payload), encoding="utf-8")
         tmp_path.replace(STATUS_FILE)
-    except OSError:
-        pass
+    except OSError as exc:
+        # E16: surface status write failures instead of swallowing silently.
+        # If /tmp is unwritable (read-only FS, full disk) the status page
+        # shows stale data with no log line to explain why.
+        print(f"Warning: could not write sync status to {STATUS_FILE}: {exc}", file=sys.stderr)
 
     if fingerprint or marker:
         state = {}
@@ -180,8 +183,8 @@ def write_status(status: str, message: str, fingerprint: str | None = None, mark
             tmp_state = STATE_FILE.with_suffix(".tmp")
             tmp_state.write_text(json.dumps(state), encoding="utf-8")
             os.replace(tmp_state, STATE_FILE)
-        except OSError:
-            pass
+        except OSError as exc:
+            print(f"Warning: could not write sync state to {STATE_FILE}: {exc}", file=sys.stderr)
 
 
 def resolve_backup_repo() -> str:
@@ -460,6 +463,24 @@ def restore() -> bool:
         return False
 
 
+def load_state() -> tuple[str | None, tuple[int, int, int] | None]:
+    """E17: load (last_fingerprint, last_marker) from STATE_FILE.
+
+    Factored from the duplicated parse block that appeared in both sync_once
+    and loop. Returns (None, None) if the file is missing/corrupt.
+    """
+    if not STATE_FILE.exists():
+        return (None, None)
+    try:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        last_fingerprint = state.get("last_fingerprint")
+        m = state.get("last_marker")
+        last_marker = tuple(m) if m and len(m) == 3 else None
+        return (last_fingerprint, last_marker)
+    except Exception:
+        return (None, None)
+
+
 def sync_once(last_fingerprint: str | None = None, last_marker: tuple[int, int, int] | None = None):
     # Inter-process lock: the loop process and a separate CLI sync-once
     # (run by start.sh's graceful_shutdown / exit handler) can both call
@@ -480,15 +501,7 @@ def sync_once(last_fingerprint: str | None = None, last_marker: tuple[int, int, 
         except OSError:
             _LOCK_HANDLE = None  # non-fatal; proceed without the lock
     if last_fingerprint is None and last_marker is None:
-        if STATE_FILE.exists():
-            try:
-                state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-                last_fingerprint = state.get("last_fingerprint")
-                m = state.get("last_marker")
-                if m and len(m) == 3:
-                    last_marker = tuple(m)
-            except Exception:
-                pass
+        last_fingerprint, last_marker = load_state()
 
     repo_id = ensure_repo_exists()
     current_marker = metadata_marker(HERMES_HOME)
@@ -547,15 +560,7 @@ def loop() -> int:
     # Seed from any prior run so we don't re-upload an identical tree.
     last_fingerprint: str | None = None
     last_marker: tuple[int, int, int] | None = None
-    if STATE_FILE.exists():
-        try:
-            state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            last_fingerprint = state.get("last_fingerprint")
-            m = state.get("last_marker")
-            if m and len(m) == 3:
-                last_marker = tuple(m)
-        except Exception:
-            pass
+    last_fingerprint, last_marker = load_state()
     if last_marker is None:
         last_marker = metadata_marker(HERMES_HOME)
 

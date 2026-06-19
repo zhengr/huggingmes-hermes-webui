@@ -20,7 +20,10 @@ TELEGRAM_WEBHOOK_PORT="${TELEGRAM_WEBHOOK_PORT:-8765}"
 WEBUI_PORT="${HERMES_WEBUI_PORT:-8787}"
 
 SYNC_INTERVAL="${SYNC_INTERVAL:-60}"
-BACKUP_DATASET="${BACKUP_DATASET_NAME:-huggingmes-backup}"
+# E15: export so downstream scripts could read it if needed; hermes-sync.py
+# reads BACKUP_DATASET_NAME from env directly, so this is for the startup
+# summary + any future callers.
+export BACKUP_DATASET="${BACKUP_DATASET_NAME:-huggingmes-backup}"
 CF_PROXY_ENV_FILE="/tmp/huggingmes-cloudflare-proxy.env"
 
 export HERMES_HOME
@@ -69,11 +72,13 @@ cd "$HERMES_HOME/workspace" || cd "$HERMES_HOME"
 # rotation those files grow forever and end up in the HF Dataset backup.
 # Strategy: if a log is >5MB, rename to .1 (overwriting any previous .1)
 # and start fresh. Cheap, deterministic, no cron needed.
+# Threshold is env-configurable (default 5 MiB) so a noisy space can tune it.
+LOG_ROTATE_BYTES="${LOG_ROTATE_BYTES:-5242880}"
 if [ -d "$HERMES_HOME/logs" ]; then
   for f in "$HERMES_HOME/logs"/*.log; do
     [ -f "$f" ] || continue
     sz=$(stat -c%s "$f" 2>/dev/null || echo 0)
-    if [ "$sz" -gt 5242880 ]; then
+    if [ "$sz" -gt "$LOG_ROTATE_BYTES" ]; then
       mv -f "$f" "${f}.1"
       : > "$f"
       echo "rotated $(basename "$f") ($sz bytes -> .1)"

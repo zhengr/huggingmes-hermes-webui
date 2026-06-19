@@ -4,6 +4,10 @@
 ARG HERMES_AGENT_VERSION=latest
 FROM nousresearch/hermes-agent:${HERMES_AGENT_VERSION}
 
+# Re-declare so the ARG is in scope after FROM (a pre-FROM ARG is only
+# visible inside the FROM instruction under the classic builder; BuildKit
+# is more permissive but re-declaring is portable).
+ARG HERMES_AGENT_VERSION
 ARG WEBUI_REF=master
 
 USER root
@@ -42,9 +46,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && uv pip install --python /opt/hermes/.venv/bin/python --no-cache-dir \
         huggingface_hub hf_transfer pyyaml
 
-# Clone nesquena/hermes-webui (install deps into the agent venv so imports resolve)
+# Clone nesquena/hermes-webui (install deps into the agent venv so imports resolve).
+# WEBUI_REF defaults to master (moving target) — record the resolved commit so
+# a build can be traced back to an exact upstream revision. Combined with the
+# build-time patches below, this makes silent patch-skip failures debuggable.
 RUN git clone --depth 1 --branch ${WEBUI_REF} \
         https://github.com/nesquena/hermes-webui.git /opt/hermes-webui \
+ && cd /opt/hermes-webui && git rev-parse HEAD > /opt/hermes-webui/WEBUI_COMMIT \
  && ( [ -f /opt/hermes-webui/requirements.txt ] \
       && /opt/hermes/.venv/bin/pip install --no-cache-dir -r /opt/hermes-webui/requirements.txt \
       || true ) \
