@@ -63,7 +63,16 @@ EXCLUDED_DIRS = {
     "venv",
     "logs",          # log files are useless after a restart
 }
-EXCLUDED_TOP_LEVEL = {"logs", STATE_FILE.name}
+EXCLUDED_TOP_LEVEL = {
+    "logs",
+    STATE_FILE.name,
+    # config.yaml can carry plaintext provider api_key (written by start.sh
+    # when CUSTOM_BASE_URL is set) and is backed up to the dataset by default.
+    # The Telegram webhook secret is a credential that lets an attacker forge
+    # webhook calls. Neither belongs in a remote backup.
+    "config.yaml",
+    ".huggingmes-telegram-webhook-secret",
+}
 EXCLUDED_SUFFIXES = (
     ".log", ".log.1", ".log.2",
     ".db-shm", ".db-wal", ".db-journal",

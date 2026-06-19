@@ -284,8 +284,11 @@ else:
 custom_base = os.environ.get("CUSTOM_BASE_URL", "").strip()
 if custom_base and model_name:
     model.setdefault("base_url", custom_base.rstrip("/"))
-    if os.environ.get("CUSTOM_API_KEY"):
-        model.setdefault("api_key", os.environ["CUSTOM_API_KEY"])
+    # Do NOT write the api_key into config.yaml — it would be backed up to the
+    # HF Dataset in plaintext (hermes-sync.py excludes config.yaml as
+    # defense-in-depth, but the root fix is to never persist the secret).
+    # Hermes reads ${OPENAI_API_KEY} (set from LLM_API_KEY above) from the
+    # environment at runtime, so the key does not need to live in config.yaml.
     try:
         model.setdefault("context_length", int(os.environ.get("CUSTOM_MODEL_CONTEXT_LENGTH", "131072")))
         model.setdefault("max_tokens", int(os.environ.get("CUSTOM_MODEL_MAX_TOKENS", "8192")))

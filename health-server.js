@@ -125,7 +125,7 @@ function buildSessionCookie(req) {
 function getBearerToken(req) {
   const value = req.headers.authorization || "";
   const match = /^Bearer\s+(.+)$/i.exec(value);
-  return match ? match[1] : "";
+  return match ? match[1].trim() : "";
 }
 
 function isAuthorized(req) {
@@ -139,9 +139,50 @@ function isAuthorized(req) {
   );
 }
 
+/**
+ * WebSocket Origin allowlist. Browsers send Origin on WS upgrades; we must
+ * validate it to prevent Cross-Site WebSocket Hijacking (CSWSH) — otherwise a
+ * malicious site can open a WS to the Space using the user's cookies. The
+ * allowlist is the Space's public host(s): x-forwarded-host (HF Spaces),
+ * SPACE_HOST, plus any explicit ALLOWED_WS_ORIGINS (comma-separated).
+ */
+function allowedWsOrigin(req) {
+  const raw = String(req.headers.origin || "");
+  if (!raw) return true; // non-browser WS clients (desktop app) omit Origin
+  let host = "";
+  try {
+    host = new URL(raw).host.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (!host) return false;
+  const allowed = new Set();
+  const xfh = String(req.headers["x-forwarded-host"] || "").trim().toLowerCase();
+  if (xfh) allowed.add(xfh);
+  const spaceHost = String(process.env.SPACE_HOST || "").trim().toLowerCase();
+  if (spaceHost) allowed.add(spaceHost);
+  const explicit = String(process.env.ALLOWED_WS_ORIGINS || "").toLowerCase();
+  for (const part of explicit.split(",")) {
+    const h = part.trim();
+    if (h) allowed.add(h);
+  }
+  // localhost is always allowed (local dev / same-box tools).
+  allowed.add("localhost");
+  allowed.add("127.0.0.1");
+  return allowed.has(host);
+}
+
 function sanitizeNext(value, fallback = "/") {
   if (!value || typeof value !== "string") return fallback;
-  if (!value.startsWith("/") || value.startsWith("//")) return fallback;
+  // Block protocol-relative "//evil.com" AND backslash-prefixed "/\evil.com"
+  // (browsers normalize backslash to slash, so "/\evil.com" navigates to
+  // "//evil.com" — a classic open-redirect bypass of the "//" check).
+  if (!value.startsWith("/") || value.startsWith("//") || value.startsWith("/\\")) {
+    return fallback;
+  }
+  // Restrict to a safe path charset; reject anything that could break out of
+  // the Location header value (newline, quote, control chars, etc.).
+  if (!/^\/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$/.test(value)) return fallback;
   return value;
 }
 
@@ -498,13 +539,24 @@ function proxyDashboard(req, res) {
   });
 
   // Buffer body before forwarding — same chunked-encoding fix as proxyRequest.
+  // Cap the body at 20 MB (mirrors proxyRequest) so a logged-in user (or anyone
+  // if API_SERVER_KEY is unset) can't OOM the single Node router process by
+  // POSTing an arbitrarily large body to /hm/app/api/*.
   const hasBody = req.method === "POST" || req.method === "PUT" || req.method === "PATCH";
   if (hasBody) {
     const bodyChunks = [];
     let bodySize = 0;
+    const bodyLimit = 20 * 1024 * 1024;
     req.on("data", (chunk) => {
       bodyChunks.push(chunk);
       bodySize += chunk.length;
+      if (bodySize > bodyLimit) {
+        req.destroy();
+        if (!res.headersSent) {
+          res.writeHead(413, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "payload_too_large" }));
+        }
+      }
     });
     req.on("end", () => {
       delete headers["transfer-encoding"];
@@ -686,7 +738,7 @@ function renderStatusPage(data) {
       detail: backupDetail + backupWarning,
       tone: data.backup?.warning ? "warn" : syncTone,
       meta: data.backup?.timestamp
-        ? `<span class="local-time" data-iso="${data.backup.timestamp}"></span>`
+        ? `<span class="local-time" data-iso="${escapeHtml(data.backup.timestamp)}"></span>`
         : "",
     }),
     renderTile({
@@ -797,16 +849,27 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 3. /status — unauthenticated JSON status dump.
+  // 3. /status — admin diagnostics. Gate behind requireAuth to avoid leaking
+  //    internal ports, telegram.webhookUrl, model/provider, authConfigured,
+  //    and backup/keepalive state to unauthenticated callers. /health above
+  //    stays public (it only returns ok/gateway/webui/uptime).
   if (path === "/status" || path === "/api/status") {
+    if (!requireAuth(req, res)) return;
     const data = await statusPayload();
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(data, null, 2));
     return;
   }
 
-  // 4. /telegram — webhook endpoint; no auth (Telegram can't do our cookie).
+  // 4. /telegram — webhook endpoint; no router auth (Telegram can't do our
+  //    cookie), but only forward if Telegram is actually configured. The
+  //    gateway's webhook handler validates X-Telegram-Bot-Api-Secret-Token.
   if (path === "/telegram" || path.startsWith("/telegram/")) {
+    if (!process.env.TELEGRAM_BOT_TOKEN) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "telegram_not_configured" }));
+      return;
+    }
     proxyRequest(req, res, TELEGRAM_WEBHOOK_PORT);
     return;
   }
@@ -1149,10 +1212,46 @@ server.listen(PORT, "0.0.0.0", () => {
  * Both the Hermes dashboard and hermes-webui can open WebSocket
  * connections for live updates. Route the upgrade to the correct
  * upstream based on path prefix + referer, same as HTTP requests.
+ *
+ * SECURITY: the HTTP handler enforces isAuthorized() on /v1/* and
+ * /hm/app/*. The upgrade handler used to enforce NONE of that, so a
+ * client could open a WS to /v1/* without a bearer or /hm/app/* without
+ * the session cookie — bypassing the entire auth model for WS. We now
+ * mirror the HTTP auth on the WS upgrade path. /hmd* stays open by
+ * design (off-Space desktop workspace; the dashboard's own session
+ * token gates writes), but we validate Origin to prevent CSWSH.
  */
 server.on("upgrade", (req, clientSocket, head) => {
   const parsed = new URL(req.url, "http://localhost");
   const path = parsed.pathname;
+
+  // Auth gate mirroring the HTTP handler.
+  const needsAuth =
+    path === "/v1" ||
+    path.startsWith("/v1/") ||
+    path === HM_PREFIX ||
+    path.startsWith(`${HM_PREFIX}/`) ||
+    path === `${HM_PREFIX}/app` ||
+    path.startsWith(`${HM_PREFIX}/app/`);
+  if (needsAuth && !isAuthorized(req)) {
+    try {
+      clientSocket.end("HTTP/1.1 401 Unauthorized\r\n\r\n");
+    } catch {
+      try { clientSocket.destroy(); } catch {}
+    }
+    return;
+  }
+  // Origin validation for ALL WS upgrades (CSWSH defense). allowedWsOrigin
+  // returns true for empty Origin (non-browser clients like the desktop app)
+  // and for hosts matching the Space / localhost / explicit allowlist.
+  if (!allowedWsOrigin(req)) {
+    try {
+      clientSocket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
+    } catch {
+      try { clientSocket.destroy(); } catch {}
+    }
+    return;
+  }
 
   let targetPort = WEBUI_PORT;
   let targetPath = req.url;
@@ -1168,6 +1267,11 @@ server.on("upgrade", (req, clientSocket, head) => {
   })();
   const refererIsDashboard = refererPath.startsWith(`${HM_PREFIX}/app`);
 
+  // Whether to rewrite Host/Origin to the local backend so it accepts the
+  // handshake. /v1 and /hm/app backends check against their own bind host;
+  // /hmd passthrough forwards the real Origin and lets the dashboard decide.
+  let rewriteLocalOrigin = true;
+
   if (path === "/v1" || path.startsWith("/v1/")) {
     targetPort = GATEWAY_PORT;
   } else if (path === HMD_PREFIX || path.startsWith(`${HMD_PREFIX}/`)) {
@@ -1175,6 +1279,7 @@ server.on("upgrade", (req, clientSocket, head) => {
     targetPort = DASHBOARD_PORT;
     targetPath = path.replace(HMD_PREFIX, "") || "/";
     if (parsed.search) targetPath += parsed.search;
+    rewriteLocalOrigin = false; // let the dashboard's own origin check run
   } else if (path === `${HM_PREFIX}/app` || path.startsWith(`${HM_PREFIX}/app/`)) {
     targetPort = DASHBOARD_PORT;
     targetPath = path.replace(`${HM_PREFIX}/app`, "") || "/";
@@ -1196,19 +1301,20 @@ server.on("upgrade", (req, clientSocket, head) => {
       `${req.method} ${targetPath} HTTP/1.1`,
     ];
     for (const [name, value] of Object.entries(req.headers)) {
-      // Rewrite Host and Origin so the backend accepts the WS handshake.
-      // The dashboard's origin guard checks Origin against its own host.
-      if (name.toLowerCase() === "host") {
+      const lower = name.toLowerCase();
+      if (lower === "host") {
         headerLines.push(`Host: ${localHost}`);
         continue;
       }
-      if (name.toLowerCase() === "origin") {
-        // Rewrite wss://<space>.hf.space or https:// to the local backend.
-        try {
-          const origUrl = new URL(value);
+      if (lower === "origin") {
+        if (rewriteLocalOrigin) {
+          // /v1 + /hm/app: backend requires the local origin to accept the
+          // handshake. We already validated the incoming Origin above.
           headerLines.push(`Origin: http://${localHost}`);
-        } catch {
-          headerLines.push(`Origin: http://${localHost}`);
+        } else {
+          // /hmd passthrough: forward the real Origin so the dashboard's own
+          // origin guard runs (it accepts the off-Space workspace's origin).
+          headerLines.push(`Origin: ${value}`);
         }
         continue;
       }
