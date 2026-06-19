@@ -377,8 +377,14 @@ echo "Launching Hermes dashboard on 127.0.0.1:${DASHBOARD_PORT}..."
 DASHBOARD_PID=$!
 
 # ── Launch Hermes gateway ─────────────────────────────────────────────
+# v0.17.0 (v2026.6.19) reworked gateway supervision: "gateway run" is no
+# longer documented, and "gateway restart" now probes for s6 → falls back
+# to a systemd user service (→ "linger is not enabled" error). In the HF
+# Space container there is no s6 and no systemd, so the only supported path
+# is foreground mode: `hermes gateway`. See:
+# https://hermes-agent.nousresearch.com/docs/user-guide/messaging
 echo "Launching Hermes gateway..."
-(hermes gateway run 2>&1 | tee -a "$HERMES_HOME/logs/gateway.log") &
+(hermes gateway 2>&1 | tee -a "$HERMES_HOME/logs/gateway.log") &
 GATEWAY_PID=$!
 
 GATEWAY_READY_TIMEOUT="${GATEWAY_READY_TIMEOUT:-120}"
