@@ -106,7 +106,7 @@ export CLOUDFLARE_WORKERS_TOKEN
 if [ -n "${CLOUDFLARE_WORKERS_TOKEN:-}" ] || [ -n "${CLOUDFLARE_PROXY_URL:-}" ]; then
   export CLOUDFLARE_PROXY_DEBUG="${CLOUDFLARE_PROXY_DEBUG:-false}"
   echo "Preparing Cloudflare Telegram proxy..."
-  python3 "$APP_DIR/cloudflare-proxy-setup.py" || true
+  python3 "$APP_DIR/cloudflare-proxy-setup.py" || echo "WARNING: Cloudflare Telegram proxy setup failed; Telegram outbound proxy will be unavailable."
   if [ -f "$CF_PROXY_ENV_FILE" ]; then
     . "$CF_PROXY_ENV_FILE"
   fi
@@ -114,7 +114,7 @@ fi
 
 if [ -n "${CLOUDFLARE_WORKERS_TOKEN:-}" ]; then
   echo "Preparing Cloudflare Keepalive worker..."
-  python3 "$APP_DIR/cloudflare-keepalive-setup.py" || true
+  python3 "$APP_DIR/cloudflare-keepalive-setup.py" || echo "WARNING: Cloudflare Keepalive setup failed; the Space may fall asleep without periodic pings."
 fi
 
 # ── Telegram env normalisation (aliases + webhook URL + secret) ───────
@@ -362,22 +362,52 @@ echo "Dashboard  : 127.0.0.1:${DASHBOARD_PORT}"
 echo ""
 
 # ── Graceful shutdown ─────────────────────────────────────────────────
+# Stop the sync loop FIRST (so its STOP_EVENT fires and it releases the
+# sync lock before we run the final sync-once), then run a single bounded
+# sync, then kill the process groups of every supervised child.
 graceful_shutdown() {
   echo "Shutting down..."
-  if [ -n "${HF_TOKEN:-}" ]; then
-    python3 "$APP_DIR/hermes-sync.py" sync-once || echo "Warning: shutdown sync failed."
+  if [ -n "${LOOP_PID:-}" ]; then
+    kill -TERM "$LOOP_PID" 2>/dev/null || true
+    # Give the loop up to 10s to drain and release the sync lock.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "$LOOP_PID" 2>/dev/null || break
+      sleep 1
+    done
+    kill -KILL "$LOOP_PID" 2>/dev/null || true
   fi
-  kill $(jobs -p) 2>/dev/null || true
+  if [ -n "${HF_TOKEN:-}" ]; then
+    # Bound the final sync so a hung HF Hub call doesn't block HF's exit
+    # grace period (HF SIGKILLs after ~30s on Free tier).
+    timeout 25 python3 "$APP_DIR/hermes-sync.py" sync-once || echo "Warning: shutdown sync failed."
+  fi
+  # Kill process groups, not just job PIDs. The services are pipelines
+  # (cmd | tee), so killing the subshell PID leaves hermes/tee alive and
+  # the port bound. setsid (below) makes each child its own session/group
+  # leader, so kill -- -PGID takes down the whole group.
+  for pid in "${HEALTH_PID:-}" "${DASHBOARD_PID:-}" "${GATEWAY_PID:-}" "${WEBUI_PID:-}" "${LOOP_PID:-}"; do
+    [ -n "$pid" ] || continue
+    kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+  done
   exit 0
 }
 trap graceful_shutdown SIGTERM SIGINT
 
 # ── Start the public-facing router (port 7861) ────────────────────────
-node "$APP_DIR/health-server.js" &
+# setsid makes each service a session/process-group leader so graceful_shutdown
+# can kill -- -PGID and take down the whole pipeline (hermes + tee), not just
+# the subshell. Without this, kill $(jobs -p) left hermes bound to its port.
+setsid node "$APP_DIR/health-server.js" &
 HEALTH_PID=$!
 
+# Optional startup webhook. Validate the URL is https:// (SSRF defense — an
+# attacker who can set Space Variables could otherwise point this at an
+# internal address) and bound the request so a hung endpoint doesn't leak a
+# zombie. Failures are logged, not fatal.
 if [ -n "${WEBHOOK_URL:-}" ]; then
-  python3 - <<'PY' >/dev/null 2>&1 &
+  case "$WEBHOOK_URL" in
+    https://*)
+      python3 - <<'PY' >/dev/null 2>&1 &
 import json, os, urllib.request
 body = json.dumps({
     "event": "restart",
@@ -389,11 +419,16 @@ req = urllib.request.Request(os.environ["WEBHOOK_URL"], data=body, method="POST"
                              headers={"Content-Type": "application/json"})
 urllib.request.urlopen(req, timeout=10).read()
 PY
+      ;;
+    *)
+      echo "WARNING: WEBHOOK_URL must start with https:// — skipping startup webhook."
+      ;;
+  esac
 fi
 
 # ── Launch Hermes dashboard (private; proxied via /hm/app) ────────────
 echo "Launching Hermes dashboard on 127.0.0.1:${DASHBOARD_PORT}..."
-(cd "$HERMES_HOME/workspace" && hermes dashboard --host 127.0.0.1 --insecure 2>&1 | tee -a "$HERMES_HOME/logs/dashboard.log") &
+setsid bash -c '(cd "$HERMES_HOME/workspace" && hermes dashboard --host 127.0.0.1 --insecure 2>&1 | tee -a "$HERMES_HOME/logs/dashboard.log")' &
 DASHBOARD_PID=$!
 
 # ── Launch Hermes gateway ─────────────────────────────────────────────
@@ -412,13 +447,16 @@ DASHBOARD_PID=$!
 # directory" and causing the gateway to fail/loop on startup.
 mkdir -p "$HERMES_HOME/workspace" "$HERMES_HOME/logs"
 echo "Launching Hermes gateway..."
-(cd "$HERMES_HOME/workspace" && hermes gateway 2>&1 | tee -a "$HERMES_HOME/logs/gateway.log") &
+setsid bash -c '(cd "$HERMES_HOME/workspace" && hermes gateway 2>&1 | tee -a "$HERMES_HOME/logs/gateway.log")' &
 GATEWAY_PID=$!
 
 GATEWAY_READY_TIMEOUT="${GATEWAY_READY_TIMEOUT:-120}"
 ready=false
 for ((i=0; i<GATEWAY_READY_TIMEOUT; i++)); do
-  if (echo > "/dev/tcp/127.0.0.1/${GATEWAY_API_PORT}") 2>/dev/null; then
+  # Real HTTP probe instead of a bare TCP connect: a wedged backend can
+  # accept the socket while never responding. curl -fsS returns non-zero
+  # on any non-2xx or connection failure.
+  if curl -fsS "$GATEWAY_HEALTH_URL/health" >/dev/null 2>&1; then
     ready=true
     break
   fi
@@ -449,16 +487,21 @@ export HERMES_WEBUI_AUTO_INSTALL="0"
 mkdir -p "$HERMES_WEBUI_STATE_DIR"
 
 echo "Launching Hermes WebUI on 127.0.0.1:${WEBUI_PORT}..."
-(cd "$WEBUI_REPO" && \
+setsid bash -c '(cd "$WEBUI_REPO" && \
    "$HERMES_WEBUI_PYTHON" "$WEBUI_REPO/server.py" 2>&1 | \
-   tee -a "$HERMES_HOME/logs/webui.log") &
+   tee -a "$HERMES_HOME/logs/webui.log")' &
 WEBUI_PID=$!
 
-# Wait for WebUI to bind its port (non-fatal on timeout — router handles it)
+# Wait for WebUI to bind its port. Previously this was "non-fatal" (warn +
+# continue), which left / broken with the router 502ing on every page load.
+# Treat bind failure as fatal like the gateway: retry once after a short
+# sleep, then exit 1 so HF restarts the Space.
 WEBUI_READY_TIMEOUT="${WEBUI_READY_TIMEOUT:-60}"
+webui_ready=false
 for ((i=0; i<WEBUI_READY_TIMEOUT; i++)); do
-  if (echo > "/dev/tcp/127.0.0.1/${WEBUI_PORT}") 2>/dev/null; then
+  if curl -fsS "http://127.0.0.1:${WEBUI_PORT}/" >/dev/null 2>&1; then
     echo "Hermes WebUI is up."
+    webui_ready=true
     break
   fi
   if ! kill -0 "$WEBUI_PID" 2>/dev/null; then
@@ -468,16 +511,35 @@ for ((i=0; i<WEBUI_READY_TIMEOUT; i++)); do
   fi
   sleep 1
 done
+if [ "$webui_ready" != "true" ]; then
+  echo ""
+  echo "Hermes WebUI failed to bind 127.0.0.1:${WEBUI_PORT}. Last 20 log lines:"
+  echo "----------------------------------------"
+  tail -20 "$HERMES_HOME/logs/webui.log" || true
+  exit 1
+fi
 
 # ── Periodic backup loop ──────────────────────────────────────────────
 if [ -n "${HF_TOKEN:-}" ]; then
   python3 -u "$APP_DIR/hermes-sync.py" loop &
+  LOOP_PID=$!
 fi
 
-# ── Wait on the gateway (primary supervision target) ──────────────────
-wait "$GATEWAY_PID"
+# ── Supervise all children ─────────────────────────────────────────────
+# Previously we only waited on GATEWAY_PID, so if the dashboard or WebUI
+# crashed after boot, the container kept "running" with a broken UI while
+# /health still returned green. wait -n (bash 4.3+, present in the Debian
+# base image) returns when ANY tracked child exits; we then sync + exit so
+# HF restarts the whole Space rather than running half-broken.
+PIDS=()
+for pid in "${HEALTH_PID:-}" "${DASHBOARD_PID:-}" "${GATEWAY_PID:-}" "${WEBUI_PID:-}" "${LOOP_PID:-}"; do
+  [ -n "$pid" ] && PIDS+=("$pid")
+done
+wait -n "${PIDS[@]}" 2>/dev/null || true
+EXIT_CODE=$?
 
-if [ -n "${HF_TOKEN:-}" ]; then
-  echo "Gateway exited - syncing state before shutdown..."
-  python3 "$APP_DIR/hermes-sync.py" sync-once || echo "Warning: final sync failed."
+if [ -n "${HF_TOKEN:-}" ] && [ -n "${LOOP_PID:-}" ]; then
+  echo "A supervised service exited - syncing state before shutdown..."
+  timeout 25 python3 "$APP_DIR/hermes-sync.py" sync-once || echo "Warning: final sync failed."
 fi
+exit "$EXIT_CODE"

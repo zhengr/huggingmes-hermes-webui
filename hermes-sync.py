@@ -19,6 +19,16 @@ import threading
 import time
 from pathlib import Path
 
+try:
+    import fcntl  # POSIX only; always available on the Linux HF Space container
+except ImportError:  # pragma: no cover - non-POSIX dev environments
+    fcntl = None
+
+# Inter-process lock so concurrent sync_once calls (loop + shutdown sync)
+# don't race on the same HF Dataset commit.
+SYNC_LOCK_PATH = "/tmp/huggingmes-sync.lock"
+_LOCK_HANDLE = None
+
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("HF_HUB_VERBOSITY", "error")
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "300")
@@ -163,8 +173,13 @@ def write_status(status: str, message: str, fingerprint: str | None = None, mark
         if marker:
             state["last_marker"] = list(marker)
         state["last_sync"] = timestamp
+        # Atomic write: tmp + os.replace so a SIGKILL/OOM mid-write can't
+        # leave STATE_FILE truncated (which would reset the marker and force
+        # a redundant full re-upload on the next change).
         try:
-            STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
+            tmp_state = STATE_FILE.with_suffix(".tmp")
+            tmp_state.write_text(json.dumps(state), encoding="utf-8")
+            os.replace(tmp_state, STATE_FILE)
         except OSError:
             pass
 
@@ -312,18 +327,74 @@ def restore() -> bool:
                 return True
 
             HERMES_HOME.mkdir(parents=True, exist_ok=True)
+            # Atomic per-entry swap: rename the existing entry to .bak, move
+            # the restored entry into place, then remove .bak. If anything
+            # fails mid-copy the .bak is restored, so a partial restore never
+            # leaves HERMES_HOME half-overwritten with the original gone.
             for child in tmp_path.iterdir():
                 if should_exclude(child.name, child):
                     continue
                 target = HERMES_HOME / child.name
-                if target.is_dir():
-                    shutil.rmtree(target, ignore_errors=True)
-                elif target.exists():
-                    target.unlink()
-                if child.is_dir():
-                    shutil.copytree(child, target)
-                else:
-                    shutil.copy2(child, target)
+                backup = HERMES_HOME / f"{child.name}.restore-bak"
+                # Clear any stale backup from a previous interrupted restore.
+                if backup.exists():
+                    if backup.is_dir():
+                        shutil.rmtree(backup, ignore_errors=True)
+                    else:
+                        try:
+                            backup.unlink()
+                        except OSError:
+                            pass
+                # Move existing aside (atomic rename on same filesystem).
+                moved_existing = False
+                if target.exists():
+                    try:
+                        os.rename(target, backup)
+                        moved_existing = True
+                    except OSError:
+                        # If rename fails (cross-device, busy), fall back to
+                        # the old delete-then-copy path for this entry only.
+                        if target.is_dir():
+                            shutil.rmtree(target, ignore_errors=True)
+                        else:
+                            try:
+                                target.unlink()
+                            except OSError:
+                                pass
+                # Copy restored entry into place.
+                try:
+                    if child.is_dir():
+                        shutil.copytree(child, target)
+                    else:
+                        shutil.copy2(child, target)
+                except OSError:
+                    # Restore failed — roll back to the original if we moved it.
+                    if moved_existing and backup.exists():
+                        try:
+                            if backup.is_dir() and not target.exists():
+                                os.rename(backup, target)
+                            elif backup.is_dir():
+                                shutil.rmtree(target, ignore_errors=True)
+                                os.rename(backup, target)
+                            else:
+                                if target.exists():
+                                    try:
+                                        target.unlink()
+                                    except OSError:
+                                        pass
+                                os.rename(backup, target)
+                        except OSError:
+                            pass
+                    raise
+                # Success — drop the backup.
+                if backup.exists():
+                    if backup.is_dir():
+                        shutil.rmtree(backup, ignore_errors=True)
+                    else:
+                        try:
+                            backup.unlink()
+                        except OSError:
+                            pass
 
         elapsed = round(time.time() - t0, 1)
         write_status("restored", f"Restored Hermes state from {repo_id} ({elapsed}s)")
@@ -335,16 +406,46 @@ def restore() -> bool:
         if exc.response is not None and exc.response.status_code == 404:
             write_status("fresh", f"Backup dataset {repo_id} does not exist yet.")
             return True
-        write_status("error", f"Restore failed: {exc}")
-        print(f"Restore failed: {exc}", file=sys.stderr)
+        # Transient HF outage (5xx, network) — distinguish from "no dataset".
+        # Boot continues (start.sh runs restore with `|| true`) but surface a
+        # loud banner so the user doesn't silently boot into an empty state.
+        write_status(
+            "error",
+            f"Restore failed (transient?): {exc}. Hermes will boot with an "
+            "empty/fresh state — your data is safe in the dataset, this is "
+            "likely a temporary HF Hub issue. A restart should restore it.",
+        )
+        print(f"Restore failed (transient?): {exc}", file=sys.stderr)
         return False
     except Exception as exc:
-        write_status("error", f"Restore failed: {exc}")
+        write_status(
+            "error",
+            f"Restore failed: {exc}. Hermes will boot with an empty/fresh "
+            "state; your data is safe in the dataset.",
+        )
         print(f"Restore failed: {exc}", file=sys.stderr)
         return False
 
 
 def sync_once(last_fingerprint: str | None = None, last_marker: tuple[int, int, int] | None = None):
+    # Inter-process lock: the loop process and a separate CLI sync-once
+    # (run by start.sh's graceful_shutdown / exit handler) can both call
+    # upload_folder against the same dataset concurrently, racing on HF
+    # Hub commits and doubling disk usage with two snapshot temp dirs.
+    # The lock is acquired once per process and held for the process
+    # lifetime (sync_once is never re-entrant within a process); the
+    # *other* process blocks here until the holder exits and the OS
+    # releases the flock.
+    global _LOCK_HANDLE
+    if fcntl is not None and _LOCK_HANDLE is None:
+        try:
+            _LOCK_HANDLE = open(SYNC_LOCK_PATH, "w")
+            # Blocking exclusive lock. The holder keeps it until process exit
+            # (no explicit release — OS releases on close/exit). This is
+            # intentional: within one process sync_once is sequential.
+            fcntl.flock(_LOCK_HANDLE, fcntl.LOCK_EX)
+        except OSError:
+            _LOCK_HANDLE = None  # non-fatal; proceed without the lock
     if last_fingerprint is None and last_marker is None:
         if STATE_FILE.exists():
             try:

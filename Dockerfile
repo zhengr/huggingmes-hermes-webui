@@ -8,7 +8,10 @@ ARG WEBUI_REF=master
 
 USER root
 
-# System deps (mirrors HuggingMes) + git/nodejs for WebUI checkout + router
+# System deps (mirrors HuggingMes) + git/nodejs for WebUI checkout + router.
+# tini: proper PID 1 — forwards signals to the bash trap and reaps zombies
+# from the piped `tee`/`hermes` subprocesses. Without it, bash as PID 1 does
+# not forward SIGTERM to children reliably and zombies accumulate.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
@@ -17,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     nodejs \
     npm \
+    tini \
     chromium \
     libnss3 \
     libatk1.0-0 \
@@ -191,4 +195,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=120s \
   CMD curl -fsS http://localhost:7861/health || exit 1
 
 USER hermes
-ENTRYPOINT ["/opt/huggingmes/start.sh"]
+# tini as PID 1: forwards SIGTERM/SIGINT to start.sh's trap and reaps
+# orphaned tee/hermes subprocesses. The bash graceful_shutdown trap still
+# runs the final sync-once before exit.
+ENTRYPOINT ["/usr/bin/tini", "--", "/opt/huggingmes/start.sh"]
