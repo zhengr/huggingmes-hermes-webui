@@ -282,6 +282,16 @@ case "$MODEL_PREFIX" in
   opencode-go)
     [ -n "$LLM_API_KEY" ] && export OPENCODE_GO_API_KEY="${OPENCODE_GO_API_KEY:-$LLM_API_KEY}"
     ;;
+  ollama)
+    # Ollama is OpenAI-compatible. Point base_url at the Ollama instance
+    # (default: localhost:11434 — override CUSTOM_BASE_URL for a remote
+    # Ollama server). Ollama typically needs no API key, but if LLM_API_KEY
+    # is set we pass it through as OPENAI_API_KEY (Ollama ignores it).
+    [ -n "$LLM_API_KEY" ] && export OPENAI_API_KEY="${OPENAI_API_KEY:-$LLM_API_KEY}"
+    export CUSTOM_BASE_URL="${CUSTOM_BASE_URL:-http://127.0.0.1:11434/v1}"
+    MODEL_FOR_CONFIG="${MODEL_INPUT#ollama/}"
+    PROVIDER_FOR_CONFIG="${CUSTOM_PROVIDER:-custom}"
+    ;;
 esac
 
 if [ -n "${CUSTOM_BASE_URL:-}" ]; then
@@ -385,6 +395,52 @@ if env_file.exists():
     except OSError as exc:
         print(f"Warning: could not clean {env_file}: {exc}")
 PY
+
+# ── Materialize provider keys from env into .env (opt-in) ────────────
+# The dashboard's Env tab reads $HERMES_HOME/.env to show/set provider keys.
+# Space Secrets are durable (survive restarts) but only live in the process
+# environment — they're invisible in the dashboard Env tab. This optional
+# step writes known provider keys from the environment into .env so the
+# dashboard shows them. .env is NOT backed up to the HF Dataset (excluded
+# by hermes-sync.py), so this doesn't create a plaintext-at-rest risk
+# beyond what's already in the process env.
+#
+# Set WRITE_SECRETS_TO_ENV=1 as a Space Variable to enable.
+if [ "${WRITE_SECRETS_TO_ENV:-}" = "1" ] || [ "${WRITE_SECRETS_TO_ENV:-}" = "true" ]; then
+  ENV_FILE="$HERMES_HOME/.env"
+  touch "$ENV_FILE"
+  python3 - "$ENV_FILE" <<'PY'
+import os, sys, pathlib
+env_file = pathlib.Path(sys.argv[1])
+# Known provider key env vars to materialize into .env.
+PROVIDER_KEYS = [
+    "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY",
+    "GOOGLE_API_KEY", "GEMINI_API_KEY", "DEEPSEEK_API_KEY",
+    "GLM_API_KEY", "KIMI_API_KEY", "KIMI_CN_API_KEY",
+    "MINIMAX_API_KEY", "MINIMAX_CN_API_KEY", "XIAOMI_API_KEY",
+    "ARCEEAI_API_KEY", "GMI_API_KEY", "DASHSCOPE_API_KEY",
+    "TOKENHUB_API_KEY", "NVIDIA_API_KEY", "XAI_API_KEY",
+    "KILOCODE_API_KEY", "OPENCODE_ZEN_API_KEY", "OPENCODE_GO_API_KEY",
+    "AI_GATEWAY_API_KEY", "HF_TOKEN", "TELEGRAM_BOT_TOKEN",
+]
+# Read existing entries so we don't duplicate or clobber user-set values.
+existing = {}
+if env_file.exists():
+    for line in env_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        if "=" in line and not line.strip().startswith("#"):
+            k, _, _ = line.partition("=")
+            existing[k.strip()] = True
+lines = []
+for key in PROVIDER_KEYS:
+    val = os.environ.get(key, "").strip()
+    if val and key not in existing:
+        lines.append(f"{key}={val}")
+if lines:
+    with env_file.open("a", encoding="utf-8") as f:
+        f.write("\n" + "\n".join(lines) + "\n")
+    print(f"WRITE_SECRETS_TO_ENV: wrote {len(lines)} key(s) to {env_file}")
+PY
+fi
 
 # ── Startup summary ───────────────────────────────────────────────────
 echo ""
