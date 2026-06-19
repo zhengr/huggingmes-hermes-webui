@@ -10,7 +10,10 @@ umask 0077
 # ══════════════════════════════════════════════════════════════════════
 
 APP_DIR="${HUGGINGMES_APP_DIR:-/opt/huggingmes}"
-WEBUI_REPO="${HERMES_WEBUI_REPO:-/opt/hermes-webui}"
+# Export WEBUI_REPO so the setsid'd WebUI subshell (setsid bash -c '...')
+# can expand it — the inner bash starts with a fresh env and only sees
+# exported vars. HERMES_HOME is exported below; this must be too.
+export WEBUI_REPO="${HERMES_WEBUI_REPO:-/opt/hermes-webui}"
 HERMES_HOME="${HERMES_HOME:-/opt/data}"
 
 PUBLIC_PORT="${PORT:-7861}"
