@@ -89,7 +89,9 @@ if [ -z "${HERMES_DASHBOARD_SESSION_TOKEN:-}" ]; then
 fi
 
 # ── Setup state dirs ──────────────────────────────────────────────────
-mkdir -p "$HERMES_HOME"/{cron,sessions,logs,hooks,memories,skills,skins,plans,workspace,home,plugins,webui}
+# Note: plugins/ lives under $HERMES_HOME/home/.hermes/plugins via the
+# whole-~/.hermes symlink below — not as a top-level HERMES_HOME dir.
+mkdir -p "$HERMES_HOME"/{cron,sessions,logs,hooks,memories,skills,skins,plans,workspace,home,webui}
 
 # Ensure the dashboard PTY starts in the workspace dir so the desktop app's
 # file browser sees a valid directory (not /opt/hermes or /).
@@ -118,11 +120,25 @@ fi
 mkdir -p "$HERMES_HOME/.local/bin"
 ln -sfn /opt/hermes/.venv/bin/hermes "$HERMES_HOME/.local/bin/hermes"
 
-# Redirect Hermes plugin dir into volume
-if [ ! -L "${HOME}/.hermes/plugins" ]; then
-  mkdir -p "${HOME}/.hermes"
-  rm -rf "${HOME}/.hermes/plugins"
-  ln -sfn "$HERMES_HOME/plugins" "${HOME}/.hermes/plugins"
+# Redirect the entire ~/.hermes dir into the backed-up HERMES_HOME volume
+# so ALL Hermes state survives container restarts: OAuth tokens
+# (.anthropic_oauth.json, .xai_oauth.json), credential pool (auth.json),
+# pairing state, plugins, skills config, etc. Previously only plugins/ was
+# symlinked — OAuth logins done via the dashboard were lost on every restart
+# because ~/.hermes/ is on the ephemeral filesystem.
+#
+# This runs BEFORE the HF Dataset restore so restored auth files land in
+# the right place. Migration of any pre-existing ~/.hermes contents (from
+# the base image) into the volume is done safely.
+HERMES_DOT_DIR="$HERMES_HOME/home/.hermes"
+mkdir -p "$HERMES_DOT_DIR"
+if [ ! -L "${HOME}/.hermes" ]; then
+  if [ -d "${HOME}/.hermes" ] && [ ! -L "${HOME}/.hermes" ]; then
+    # Migrate existing contents (base image may ship some defaults).
+    cp -a "${HOME}/.hermes/." "$HERMES_DOT_DIR/" 2>/dev/null || true
+    rm -rf "${HOME}/.hermes"
+  fi
+  ln -sfn "$HERMES_DOT_DIR" "${HOME}/.hermes"
 fi
 
 # ── Restore state from HF Dataset ─────────────────────────────────────
