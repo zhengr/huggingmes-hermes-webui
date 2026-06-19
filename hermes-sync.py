@@ -270,8 +270,33 @@ def restore() -> bool:
     repo_id = resolve_backup_repo()
     write_status("restoring", f"Restoring Hermes state from {repo_id}")
     try:
+        # Push our exclusion rules into snapshot_download so HF Hub never
+        # downloads the files we're going to throw away anyway (logs, .env,
+        # caches, *.db-wal, files > MAX_FILE_SIZE_BYTES, etc.). Default
+        # max_workers=8 is slow for many small state files; bump it.
+        ignore_patterns = []
+        for name in EXCLUDED_TOP_LEVEL:
+            ignore_patterns.append(f"{name}")
+            ignore_patterns.append(f"{name}/*")
+        for name in EXCLUDED_DIRS:
+            ignore_patterns.append(f"**/{name}")
+            ignore_patterns.append(f"**/{name}/*")
+        for suf in EXCLUDED_SUFFIXES:
+            ignore_patterns.append(f"**/*{suf}")
+        # HF Hub ignore_patterns are glob; we can't express the >50MB size
+        # cap, so should_exclude() still runs post-download as a backstop.
+
+        t0 = time.time()
         with tempfile.TemporaryDirectory() as tmpdir:
-            snapshot_download(repo_id=repo_id, repo_type="dataset", token=HF_TOKEN, local_dir=tmpdir)
+            snapshot_download(
+                repo_id=repo_id,
+                repo_type="dataset",
+                token=HF_TOKEN,
+                local_dir=tmpdir,
+                ignore_patterns=ignore_patterns or None,
+                max_workers=int(os.environ.get("SYNC_RESTORE_WORKERS", "16")),
+                etag_timeout=30,
+            )
             tmp_path = Path(tmpdir)
             if not any(tmp_path.iterdir()):
                 write_status("fresh", "Backup dataset is empty. Starting fresh.")
@@ -291,7 +316,8 @@ def restore() -> bool:
                 else:
                     shutil.copy2(child, target)
 
-        write_status("restored", f"Restored Hermes state from {repo_id}")
+        elapsed = round(time.time() - t0, 1)
+        write_status("restored", f"Restored Hermes state from {repo_id} ({elapsed}s)")
         return True
     except RepositoryNotFoundError:
         write_status("fresh", f"Backup dataset {repo_id} does not exist yet.")
