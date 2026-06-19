@@ -76,11 +76,8 @@ EXCLUDED_DIRS = {
 EXCLUDED_TOP_LEVEL = {
     "logs",
     STATE_FILE.name,
-    # config.yaml can carry plaintext provider api_key (written by start.sh
-    # when CUSTOM_BASE_URL is set) and is backed up to the dataset by default.
     # The Telegram webhook secret is a credential that lets an attacker forge
-    # webhook calls. Neither belongs in a remote backup.
-    "config.yaml",
+    # webhook calls — it never belongs in a remote backup.
     ".huggingmes-telegram-webhook-secret",
 }
 EXCLUDED_SUFFIXES = (
@@ -319,6 +316,32 @@ def create_snapshot_dir(source_root: Path) -> Path:
             shutil.copy2(path, target)
         except OSError:
             continue
+        # Redact secrets from config.yaml before it lands in the backup.
+        # config.yaml IS backed up (so dashboard model/provider/settings
+        # survive restarts) but it can carry a plaintext model.api_key if
+        # the dashboard's config editor wrote one. Strip the api_key field
+        # from the staged copy so plaintext keys never reach the dataset.
+        # The real key comes from the process environment (Space Secrets) at
+        # runtime, so removing it from the backup doesn't break anything.
+        if rel_posix == "config.yaml":
+            try:
+                import yaml as _yaml
+                text = target.read_text(encoding="utf-8")
+                cfg = _yaml.safe_load(text)
+                if isinstance(cfg, dict):
+                    model = cfg.get("model")
+                    if isinstance(model, dict) and "api_key" in model:
+                        # Remove the api_key entirely from the staged copy so
+                        # plaintext keys never reach the dataset. The real key
+                        # comes from the process environment (Space Secrets) at
+                        # runtime — Hermes reads ${OPENAI_API_KEY} etc. from env.
+                        del model["api_key"]
+                        target.write_text(
+                            _yaml.safe_dump(cfg, sort_keys=False),
+                            encoding="utf-8",
+                        )
+            except Exception:
+                pass  # not valid YAML or no yaml module — leave as-is
     return staging_root
 
 
