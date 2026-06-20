@@ -82,7 +82,12 @@ EXCLUDED_TOP_LEVEL = {
 }
 EXCLUDED_SUFFIXES = (
     ".log", ".log.1", ".log.2",
-    ".db-shm", ".db-wal", ".db-journal",
+    # SQLite rollback-journal files are safe to drop (they're transient and
+    # only exist during a write transaction). DO NOT exclude .db-wal/.db-shm —
+    # in WAL mode, uncommitted/recent data lives in state.db-wal and the
+    # shared-memory index in state.db-shm is needed to read it. Excluding
+    # them silently drops recent sessions from the backup.
+    ".db-journal",
     ".pid", ".tmp",
 )
 if not INCLUDE_ENV:
