@@ -71,17 +71,34 @@ fi
 # value, the token changes on every Space restart → the user must re-scrape
 # it from /hmd/ HTML and reconfigure the desktop app each time.
 #
-# If HERMES_DASHBOARD_SESSION_TOKEN is set as an HF Space Secret, use it
-# (power users can pin an explicit value). Otherwise generate once and
-# persist to the backed-up HERMES_HOME so it survives restarts.
+# Precedence:
+#   1. HERMES_DASHBOARD_SESSION_TOKEN HF Space Secret (power user override)
+#   2. Derived from API_SERVER_KEY via HMAC-SHA256 (deterministic — same key
+#      → same token on every boot, no backup/restore dependency)
+#   3. Random + persisted to file (fallback when API_SERVER_KEY is also
+#      ephemeral — rare; the router generates one if GATEWAY_TOKEN is unset)
+#
+# Option 2 is the key insight: API_SERVER_KEY comes from GATEWAY_TOKEN (an
+# HF Space Secret, stable across restarts). Deriving the dashboard token
+# from it means the token is deterministic without needing the HF Dataset
+# backup — it's recomputed from scratch on every boot. This eliminates the
+# race where the token file wasn't synced before the next rebuild.
 DASHBOARD_TOKEN_FILE="$HERMES_HOME/.huggingmes-dashboard-session-token"
 if [ -z "${HERMES_DASHBOARD_SESSION_TOKEN:-}" ]; then
-  if [ -f "$DASHBOARD_TOKEN_FILE" ]; then
+  if [ -n "${API_SERVER_KEY:-}" ]; then
+    # Derive a stable token from the API key — no file/backup dependency.
+    HERMES_DASHBOARD_SESSION_TOKEN="$(python3 -c "
+import hmac, hashlib, os
+key = os.environ['API_SERVER_KEY'].encode()
+print(hmac.new(key, b'huggingmes-dashboard-session-v1', hashlib.sha256).hexdigest())
+")"
+    export HERMES_DASHBOARD_SESSION_TOKEN
+  elif [ -f "$DASHBOARD_TOKEN_FILE" ]; then
+    # No API_SERVER_KEY (ephemeral) — fall back to a persisted random token.
     export HERMES_DASHBOARD_SESSION_TOKEN="$(cat "$DASHBOARD_TOKEN_FILE" 2>/dev/null)"
   else
     HERMES_DASHBOARD_SESSION_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
     export HERMES_DASHBOARD_SESSION_TOKEN
-    # HERMES_HOME may not exist yet on first boot — mkdir covers that.
     mkdir -p "$HERMES_HOME"
     printf '%s' "$HERMES_DASHBOARD_SESSION_TOKEN" > "$DASHBOARD_TOKEN_FILE"
     chmod 600 "$DASHBOARD_TOKEN_FILE" 2>/dev/null || true
