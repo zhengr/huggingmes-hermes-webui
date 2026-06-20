@@ -61,7 +61,7 @@ HF_USERNAME = os.environ.get("HF_USERNAME", "").strip()
 SPACE_AUTHOR_NAME = os.environ.get("SPACE_AUTHOR_NAME", "").strip()
 BACKUP_DATASET_NAME = os.environ.get("BACKUP_DATASET_NAME", "huggingmes-backup").strip()
 INCLUDE_ENV = os.environ.get("SYNC_INCLUDE_ENV", "").strip().lower() in {"1", "true", "yes"}
-MAX_FILE_SIZE_BYTES = int(os.environ.get("SYNC_MAX_FILE_BYTES", str(50 * 1024 * 1024)))
+MAX_FILE_SIZE_BYTES = int(os.environ.get("SYNC_MAX_FILE_BYTES", str(200 * 1024 * 1024)))
 
 EXCLUDED_DIRS = {
     ".cache",
@@ -239,6 +239,12 @@ def should_exclude(rel_posix: str, path: Path) -> bool:
         name_lower = path.name.lower()
         if name_lower.endswith(EXCLUDED_SUFFIXES):
             return True
+        # SQLite .db files are always essential (they hold sessions, kanban,
+        # response store, etc.) — never exclude them by size, regardless of
+        # how large they grow. The size cap is for model caches and other
+        # large non-essential artifacts.
+        if name_lower.endswith(".db"):
+            return False
         try:
             return path.stat().st_size > MAX_FILE_SIZE_BYTES
         except OSError:
