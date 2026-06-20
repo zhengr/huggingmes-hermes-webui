@@ -202,13 +202,18 @@ function isAuthorized(req) {
 function allowedWsOrigin(req) {
   const raw = String(req.headers.origin || "");
   if (!raw) return true; // non-browser WS clients (desktop app) omit Origin
-  let host = "";
+  let parsed;
   try {
-    host = new URL(raw).host.toLowerCase();
+    parsed = new URL(raw);
   } catch {
     return false;
   }
-  if (!host) return false;
+  // Electron's internal pages use file:// origins — the desktop app is a
+  // trusted client, so allow file:// unconditionally.
+  if (parsed.protocol === "file:") return true;
+  const host = parsed.host.toLowerCase(); // includes port, e.g. "localhost:5173"
+  const hostname = parsed.hostname.toLowerCase(); // no port, e.g. "localhost"
+  if (!host && !hostname) return false;
   const allowed = new Set();
   const xfh = String(req.headers["x-forwarded-host"] || "").trim().toLowerCase();
   if (xfh) allowed.add(xfh);
@@ -219,10 +224,17 @@ function allowedWsOrigin(req) {
     const h = part.trim();
     if (h) allowed.add(h);
   }
-  // localhost is always allowed (local dev / same-box tools).
+  // localhost is always allowed (local dev / Electron desktop app's internal
+  // http server). Match both with and without port so localhost:5173 passes.
   allowed.add("localhost");
   allowed.add("127.0.0.1");
-  return allowed.has(host);
+  allowed.add("0.0.0.0");
+  if (allowed.has(host) || allowed.has(hostname)) return true;
+  // Also match any localhost:<port> or 127.0.0.1:<port> explicitly.
+  if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "0.0.0.0") {
+    return true;
+  }
+  return false;
 }
 
 function sanitizeNext(value, fallback = "/") {
