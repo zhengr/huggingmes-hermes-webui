@@ -1,4 +1,4 @@
-name: Sync to Hugging Face Space
+name: Sync to Hugging Face
 
 # Mirrors every push to main onto huggingface.co/spaces/f4b404/hermes
 # so the Space rebuilds automatically. Free-tier HF Spaces don't expose
