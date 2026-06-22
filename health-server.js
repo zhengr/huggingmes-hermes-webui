@@ -1108,12 +1108,16 @@ const server = http.createServer(async (req, res) => {
 
   // 5b. /api/sessions and /api/sessions/* — Hermes gateway session API.
   // The Android app (rusty4444/hermes-android) and other OpenAI-compatible
-  // clients call these directly on the gateway (port 8642), not through
-  // /v1/. Without this route they hit the WebUI catch-all, which uses a
-  // different auth scheme → 401 "invalid api key".
-  // Gate on Bearer token (same as /v1/*). The WebUI's own /api/* calls use
-  // cookie auth and don't hit /api/sessions, so there's no conflict.
-  if (path === "/api/sessions" || path.startsWith("/api/sessions/")) {
+  // clients call these directly on the gateway (port 8642) with a Bearer
+  // token. The WebUI (nesquena/hermes-webui) ALSO calls /api/sessions but
+  // uses cookie auth (no Bearer). To avoid intercepting the WebUI's own
+  // session calls (which caused a login loop), only route to the gateway
+  // when the request carries a Bearer token. Requests without Bearer fall
+  // through to the WebUI catch-all as before.
+  if (
+    (path === "/api/sessions" || path.startsWith("/api/sessions/")) &&
+    getBearerToken(req)
+  ) {
     if (!isAuthorized(req)) {
       res.writeHead(401, {
         "content-type": "application/json",
