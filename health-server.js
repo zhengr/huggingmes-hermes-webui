@@ -406,7 +406,14 @@ function proxyRequest(
     ...req.headers,
     ...headerOverrides,
     host: `${GATEWAY_HOST}:${targetPort}`,
-    origin: localOrigin,
+    // The dashboard (port 9119) checks Origin against its own bind host and
+    // rejects mismatches, so we rewrite Origin to the local backend. But the
+    // gateway (port 8642) has a CORS middleware that returns 403 for ANY
+    // non-empty Origin when API_SERVER_CORS_ORIGINS is not configured. Since
+    // the router is a reverse proxy (not a browser making a CORS request),
+    // strip Origin for gateway calls so the gateway treats it as a non-browser
+    // client and allows it. headerOverrides can re-add it if needed.
+    origin: targetPort === GATEWAY_PORT ? "" : localOrigin,
     "x-forwarded-host": req.headers.host || "",
     "x-forwarded-proto": req.headers["x-forwarded-proto"] || "https",
   };
