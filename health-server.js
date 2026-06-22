@@ -1099,6 +1099,35 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // 5b. /api/sessions and /api/sessions/* — Hermes gateway session API.
+  // The Android app (rusty4444/hermes-android) and other OpenAI-compatible
+  // clients call these directly on the gateway (port 8642), not through
+  // /v1/. Without this route they hit the WebUI catch-all, which uses a
+  // different auth scheme → 401 "invalid api key".
+  // Gate on Bearer token (same as /v1/*). The WebUI's own /api/* calls use
+  // cookie auth and don't hit /api/sessions, so there's no conflict.
+  if (path === "/api/sessions" || path.startsWith("/api/sessions/")) {
+    if (!isAuthorized(req)) {
+      res.writeHead(401, {
+        "content-type": "application/json",
+        "cache-control": "no-store",
+      });
+      res.end(
+        JSON.stringify({
+          error: "unauthorized",
+          message: "Use Authorization: Bearer <GATEWAY_TOKEN>.",
+        }),
+      );
+      return;
+    }
+    const upstreamHeaders =
+      getBearerToken(req) || !API_SERVER_KEY
+        ? {}
+        : { authorization: `Bearer ${API_SERVER_KEY}` };
+    proxyRequest(req, res, GATEWAY_PORT, (p) => p, upstreamHeaders);
+    return;
+  }
+
   // 6. /hm — HuggingMes status page.
   if (path === HM_PREFIX || path === `${HM_PREFIX}/`) {
     if (!requireAuth(req, res)) return;
