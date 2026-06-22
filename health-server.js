@@ -406,14 +406,7 @@ function proxyRequest(
     ...req.headers,
     ...headerOverrides,
     host: `${GATEWAY_HOST}:${targetPort}`,
-    // The dashboard (port 9119) checks Origin against its own bind host and
-    // rejects mismatches, so we rewrite Origin to the local backend. But the
-    // gateway (port 8642) has a CORS middleware that returns 403 for ANY
-    // non-empty Origin when API_SERVER_CORS_ORIGINS is not configured. Since
-    // the router is a reverse proxy (not a browser making a CORS request),
-    // strip Origin for gateway calls so the gateway treats it as a non-browser
-    // client and allows it. headerOverrides can re-add it if needed.
-    origin: targetPort === GATEWAY_PORT ? "" : localOrigin,
+    origin: localOrigin,
     "x-forwarded-host": req.headers.host || "",
     "x-forwarded-proto": req.headers["x-forwarded-proto"] || "https",
   };
@@ -1086,39 +1079,6 @@ const server = http.createServer(async (req, res) => {
         redirect(res, loginUrl(`${path}${parsed.search}`));
         return;
       }
-      res.writeHead(401, {
-        "content-type": "application/json",
-        "cache-control": "no-store",
-      });
-      res.end(
-        JSON.stringify({
-          error: "unauthorized",
-          message: "Use Authorization: Bearer <GATEWAY_TOKEN>.",
-        }),
-      );
-      return;
-    }
-    const upstreamHeaders =
-      getBearerToken(req) || !API_SERVER_KEY
-        ? {}
-        : { authorization: `Bearer ${API_SERVER_KEY}` };
-    proxyRequest(req, res, GATEWAY_PORT, (p) => p, upstreamHeaders);
-    return;
-  }
-
-  // 5b. /api/sessions and /api/sessions/* — Hermes gateway session API.
-  // The Android app (rusty4444/hermes-android) and other OpenAI-compatible
-  // clients call these directly on the gateway (port 8642) with a Bearer
-  // token. The WebUI (nesquena/hermes-webui) ALSO calls /api/sessions but
-  // uses cookie auth (no Bearer). To avoid intercepting the WebUI's own
-  // session calls (which caused a login loop), only route to the gateway
-  // when the request carries a Bearer token. Requests without Bearer fall
-  // through to the WebUI catch-all as before.
-  if (
-    (path === "/api/sessions" || path.startsWith("/api/sessions/")) &&
-    getBearerToken(req)
-  ) {
-    if (!isAuthorized(req)) {
       res.writeHead(401, {
         "content-type": "application/json",
         "cache-control": "no-store",
