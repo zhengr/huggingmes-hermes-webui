@@ -11,7 +11,7 @@ on:
 
 
 env:
-  IMAGE_NAME: huggingclip
+  IMAGE_NAME: huggingmes-hermes-webui
 
 
 jobs:
@@ -59,7 +59,7 @@ jobs:
         with:
 
           images: |
-            ghcr.io/${{ github.repository_owner }}/huggingclip
+            ghcr.io/${{ github.repository_owner }}/huggingmes-hermes-webui
 
           tags: |
 
