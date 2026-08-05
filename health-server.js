@@ -62,7 +62,7 @@ const CLOUDFLARE_KEEPALIVE_STATUS_FILE =
 const internalAgent = new http.Agent({
   keepAlive: true,
   maxSockets: 64,
-  timeout: 30000,
+  timeout: 300000,
 });
 
 /* ── Port probing + auth ──────────────────────────────────────────── */
@@ -462,7 +462,7 @@ function proxyRequest(
         },
       );
       // D3: 30s timeout on the upstream request.
-      proxy.setTimeout(30000, () => {
+      proxy.setTimeout(300000, () => {
         if (!res.headersSent) {
           res.writeHead(504, { "content-type": "application/json" });
           res.end(JSON.stringify({ error: "upstream_timeout" }));
@@ -521,7 +521,7 @@ function proxyRequest(
 
   // D3: 30s timeout so a hung backend (accepts the socket but never
   // responds) can't hold a request + upstream socket open forever.
-  proxy.setTimeout(30000, () => {
+  proxy.setTimeout(300000, () => {
     if (!res.headersSent) {
       res.writeHead(504, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "upstream_timeout" }));
@@ -673,7 +673,7 @@ function proxyDashboard(req, res) {
   );
 
   // D3: 30s timeout on the dashboard upstream request.
-  upstream.setTimeout(30000, () => {
+  upstream.setTimeout(300000, () => {
     if (!res.headersSent) {
       res.writeHead(504, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "upstream_timeout" }));
@@ -1341,7 +1341,7 @@ except Exception:
     print("=== build_models_payload FAILED ===")
     traceback.print_exc()
 `;
-    execFile("/opt/hermes/.venv/bin/python", ["-c", pyCode], { timeout: 30000 }, (err, stdout, stderr) => {
+    execFile("/opt/hermes/.venv/bin/python", ["-c", pyCode], { timeout: 300000 }, (err, stdout, stderr) => {
       res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
       res.end(`--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}\n--- exit ---\n${err ? err.message : "0"}`);
     });
